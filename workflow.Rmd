@@ -145,6 +145,79 @@ robust_scale <- function(x) {
   c(center = center, scale = scale)
 }
 
+estimate_debris_gate <- function(qc_df) {
+  if (nrow(qc_df) < 100) {
+    return(list(
+      data = qc_df,
+      metrics = data.frame(
+        events_after_debris = nrow(qc_df),
+        retention_debris = 1,
+        debris_cutoff = NA_real_,
+        debris_gate_status = "not_attempted",
+        debris_reference_peak = NA_real_,
+        debris_reference_width = NA_real_,
+        low_scatter_fraction = NA_real_,
+        stringsAsFactors = FALSE
+      )
+    ))
+  }
+
+  log_fsc <- log10(qc_df$FSC.A)
+  log_ssc <- log10(qc_df$SSC.A)
+  fsc_stats <- robust_scale(log_fsc)
+  ssc_stats <- robust_scale(log_ssc)
+
+  scatter_index <- 0.5 * (
+    (log_fsc - fsc_stats["center"]) / fsc_stats["scale"] +
+      (log_ssc - ssc_stats["center"]) / ssc_stats["scale"]
+  )
+  low_scatter <- scatter_index <= median(scatter_index, na.rm = TRUE)
+  low_scatter_fraction <- mean(low_scatter, na.rm = TRUE)
+
+  low_scatter_peaks <- find_density_peaks(
+    qc_df[[dna_channel]][low_scatter],
+    adjust = 1.8,
+    min_prom_frac = 0.03,
+    min_area = 0.03,
+    min_sep_log10 = 0.06
+  )
+
+  if (nrow(low_scatter_peaks) == 0) {
+    return(list(
+      data = qc_df,
+      metrics = data.frame(
+        events_after_debris = nrow(qc_df),
+        retention_debris = 1,
+        debris_cutoff = NA_real_,
+        debris_gate_status = "unresolved",
+        debris_reference_peak = NA_real_,
+        debris_reference_width = NA_real_,
+        low_scatter_fraction = low_scatter_fraction,
+        stringsAsFactors = FALSE
+      )
+    ))
+  }
+
+  first_peak <- low_scatter_peaks[1, , drop = FALSE]
+  debris_cutoff <- first_peak$left_value[1]
+  keep_debris <- qc_df[[dna_channel]] >= debris_cutoff
+  debris_df <- qc_df[keep_debris, , drop = FALSE]
+
+  list(
+    data = debris_df,
+    metrics = data.frame(
+      events_after_debris = nrow(debris_df),
+      retention_debris = nrow(debris_df) / max(nrow(qc_df), 1),
+      debris_cutoff = debris_cutoff,
+      debris_gate_status = "resolved",
+      debris_reference_peak = first_peak$peak_value[1],
+      debris_reference_width = log10(first_peak$right_value[1]) - log10(first_peak$left_value[1]),
+      low_scatter_fraction = low_scatter_fraction,
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
 apply_qc_filters <- function(dfi) {
   required_channels <- c(dna_channel, scatter_channels, time_channel)
 
@@ -170,9 +243,16 @@ apply_qc_filters <- function(dfi) {
         events_after_basic = nrow(qc_df),
         events_after_singlets = nrow(qc_df),
         events_after_time = nrow(qc_df),
+        events_after_debris = nrow(qc_df),
         retention_basic = nrow(qc_df) / nrow(dfi),
         retention_singlets = 1,
         retention_time = 1,
+        retention_debris = 1,
+        debris_cutoff = NA_real_,
+        debris_gate_status = "not_attempted",
+        debris_reference_peak = NA_real_,
+        debris_reference_width = NA_real_,
+        low_scatter_fraction = NA_real_,
         stringsAsFactors = FALSE
       )
     ))
@@ -192,9 +272,16 @@ apply_qc_filters <- function(dfi) {
         events_after_basic = sum(keep_basic),
         events_after_singlets = nrow(qc_df),
         events_after_time = nrow(qc_df),
+        events_after_debris = nrow(qc_df),
         retention_basic = sum(keep_basic) / nrow(dfi),
         retention_singlets = nrow(qc_df) / max(sum(keep_basic), 1),
         retention_time = 1,
+        retention_debris = 1,
+        debris_cutoff = NA_real_,
+        debris_gate_status = "not_attempted",
+        debris_reference_peak = NA_real_,
+        debris_reference_width = NA_real_,
+        low_scatter_fraction = NA_real_,
         stringsAsFactors = FALSE
       )
     ))
@@ -219,18 +306,22 @@ apply_qc_filters <- function(dfi) {
   }
 
   qc_time_df <- qc_df[keep_time, , drop = FALSE]
+  debris_result <- estimate_debris_gate(qc_time_df)
 
   list(
-    data = qc_time_df,
-    metrics = data.frame(
-      events_raw = nrow(dfi),
-      events_after_basic = sum(keep_basic),
-      events_after_singlets = nrow(qc_df),
-      events_after_time = nrow(qc_time_df),
-      retention_basic = sum(keep_basic) / nrow(dfi),
-      retention_singlets = nrow(qc_df) / max(sum(keep_basic), 1),
-      retention_time = nrow(qc_time_df) / max(nrow(qc_df), 1),
-      stringsAsFactors = FALSE
+    data = debris_result$data,
+    metrics = cbind(
+      data.frame(
+        events_raw = nrow(dfi),
+        events_after_basic = sum(keep_basic),
+        events_after_singlets = nrow(qc_df),
+        events_after_time = nrow(qc_time_df),
+        retention_basic = sum(keep_basic) / nrow(dfi),
+        retention_singlets = nrow(qc_df) / max(sum(keep_basic), 1),
+        retention_time = nrow(qc_time_df) / max(nrow(qc_df), 1),
+        stringsAsFactors = FALSE
+      ),
+      debris_result$metrics
     )
   )
 }
@@ -311,6 +402,9 @@ annotate_peaks <- function(qc_df, peaks, pass_label) {
   peaks$median_logFSC <- NA_real_
   peaks$median_logSSC <- NA_real_
   peaks$scatter_shift <- NA_real_
+  peaks$log_width <- log10(peaks$right_value) - log10(peaks$left_value)
+  peaks$local_cv <- NA_real_
+  peaks$peak_quality <- NA_real_
   peaks$pass <- pass_label
 
   for (i in seq_len(nrow(peaks))) {
@@ -319,6 +413,8 @@ annotate_peaks <- function(qc_df, peaks, pass_label) {
     peaks$median_logFSC[i] <- median(log10(sub_df$FSC.A), na.rm = TRUE)
     peaks$median_logSSC[i] <- median(log10(sub_df$SSC.A), na.rm = TRUE)
     peaks$scatter_shift[i] <- (peaks$median_logFSC[i] - overall_center) / overall_iqr
+    peaks$local_cv[i] <- sd(sub_df[[dna_channel]], na.rm = TRUE) / mean(sub_df[[dna_channel]], na.rm = TRUE)
+    peaks$peak_quality[i] <- log1p(peaks$prominence[i]) - peaks$log_width[i] - peaks$local_cv[i]
   }
 
   peaks
@@ -339,7 +435,7 @@ merge_peak_sets <- function(strict_peaks, permissive_peaks) {
     }
     close_idx <- which(
       seq_len(nrow(all_peaks)) > i &
-        abs(all_peaks$peak_log10 - all_peaks$peak_log10[i]) < 0.05
+        abs(all_peaks$peak_log10 - all_peaks$peak_log10[i]) < 0.03
     )
     keep[close_idx] <- FALSE
   }
@@ -368,13 +464,7 @@ analyze_sample <- function(file_name) {
   all_peaks <- merge_peak_sets(strict_peaks, permissive_peaks)
   dominant_peak <- if (nrow(strict_peaks) > 0) strict_peaks$peak_value[which.max(strict_peaks$area_fraction * strict_peaks$prominence)] else NA_real_
 
-  if (nrow(all_peaks) > 0 && is.finite(dominant_peak)) {
-    all_peaks$chicken_candidate <- all_peaks$peak_value < dominant_peak * 0.5 &
-      all_peaks$scatter_shift <= -0.4 &
-      all_peaks$area_fraction >= 0.05
-  } else {
-    all_peaks$chicken_candidate <- FALSE
-  }
+  all_peaks$peak_rank <- rank(all_peaks$peak_value, ties.method = "first")
 
   sample_summary <- cbind(
     data.frame(file_name = file_name, stringsAsFactors = FALSE),
@@ -396,66 +486,178 @@ analyze_sample <- function(file_name) {
   )
 }
 
-classify_chicken_reference <- function(sample_peak_tbl, sample_meta) {
-  candidate_tbl <- subset(
-    sample_peak_tbl,
-    chicken_candidate &
-      is.finite(peak_value) &
-      is.finite(scatter_shift)
+fit_reference_template <- function(reference_tbl, feature_cols) {
+  center <- setNames(numeric(length(feature_cols)), feature_cols)
+  scale <- center
+
+  for (feature in feature_cols) {
+    stats <- robust_scale(reference_tbl[[feature]])
+    center[feature] <- stats["center"]
+    scale[feature] <- stats["scale"]
+    if (!is.finite(scale[feature]) || scale[feature] <= 0) {
+      scale[feature] <- 1
+    }
+  }
+
+  list(center = center, scale = scale, feature_cols = feature_cols)
+}
+
+score_reference_candidates <- function(peak_tbl, template) {
+  if (nrow(peak_tbl) == 0) {
+    peak_tbl$reference_distance <- numeric(0)
+    peak_tbl$reference_support <- numeric(0)
+    return(peak_tbl)
+  }
+
+  feature_cols <- template$feature_cols
+  peak_tbl$reference_distance <- apply(
+    peak_tbl[, feature_cols, drop = FALSE],
+    1,
+    function(x) sqrt(sum(((x - template$center[feature_cols]) / template$scale[feature_cols])^2))
   )
 
-  control_candidates <- merge(
-    candidate_tbl,
-    subset(sample_meta, oxygen_condition == "C"),
+  scaled_distance <- peak_tbl$reference_distance - min(peak_tbl$reference_distance, na.rm = TRUE)
+  raw_support <- exp(-0.5 * scaled_distance^2)
+  support_total <- sum(raw_support)
+  if (!is.finite(support_total) || support_total <= 0) {
+    peak_tbl$reference_support <- rep(1 / nrow(peak_tbl), nrow(peak_tbl))
+  } else {
+    peak_tbl$reference_support <- raw_support / support_total
+  }
+  peak_tbl
+}
+
+classify_chicken_reference <- function(sample_peak_tbl, sample_meta) {
+  feature_cols <- c("peak_log10", "log_width", "local_cv", "scatter_shift", "peak_quality")
+
+  control_peak_tbl <- merge(
+    sample_peak_tbl,
+    subset(sample_meta, oxygen_condition == "C")[, c("file_name", "starting_ploidy")],
     by = "file_name"
   )
 
-  if (nrow(control_candidates) >= 2) {
-    control_center <- median(log10(control_candidates$peak_value), na.rm = TRUE)
-    control_scale <- robust_scale(log10(control_candidates$peak_value))["scale"]
-  } else if (nrow(candidate_tbl) >= 2) {
-    control_center <- median(log10(candidate_tbl$peak_value), na.rm = TRUE)
-    control_scale <- robust_scale(log10(candidate_tbl$peak_value))["scale"]
-  } else {
-    control_center <- NA_real_
-    control_scale <- NA_real_
-  }
-
-  if (!is.finite(control_scale) || control_scale <= 0) {
-    control_scale <- 0.12
-  }
-
-  choose_one <- function(d) {
-    if (nrow(d) == 0) {
-      return(data.frame())
+  control_candidates <- lapply(
+    split(control_peak_tbl, control_peak_tbl$file_name),
+    function(d) {
+      d <- d[order(d$peak_value), , drop = FALSE]
+      if (nrow(d) > 1) {
+        d <- d[d$peak_rank < max(d$peak_rank), , drop = FALSE]
+      }
+      head(d, min(2, nrow(d)))
     }
+  )
 
-    if (is.finite(control_center)) {
-      d$consensus_distance <- abs(log10(d$peak_value) - control_center)
-      d$consensus_score <- d$prominence * d$area_fraction / (1 + d$consensus_distance)
-      d <- d[order(d$consensus_distance, -d$consensus_score), , drop = FALSE]
-      chosen <- d[1, , drop = FALSE]
-      chosen$chicken_status <- if (chosen$consensus_distance <= max(0.18, 2 * control_scale)) "assigned" else "ambiguous"
-    } else {
-      d$consensus_distance <- NA_real_
-      d$consensus_score <- d$prominence * d$area_fraction
-      d <- d[order(-d$consensus_score), , drop = FALSE]
-      chosen <- d[1, , drop = FALSE]
-      chosen$chicken_status <- "tentative"
-    }
+  control_grid <- expand.grid(
+    lapply(control_candidates, function(d) seq_len(nrow(d))),
+    KEEP.OUT.ATTRS = FALSE,
+    stringsAsFactors = FALSE
+  )
 
-    chosen
+  evaluate_control_combo <- function(selection_row) {
+    chosen <- do.call(
+      rbind,
+      Map(
+        function(candidate_tbl, idx) candidate_tbl[idx, , drop = FALSE],
+        control_candidates,
+        as.integer(selection_row)
+      )
+    )
+
+    control_major_tbl <- do.call(
+      rbind,
+      lapply(split(control_peak_tbl, control_peak_tbl$file_name), function(d) {
+        selected_peak <- chosen$peak_value[chosen$file_name == d$file_name[1]]
+        non_reference <- d[abs(d$peak_log10 - log10(selected_peak)) >= 0.08, , drop = FALSE]
+        if (nrow(non_reference) == 0) {
+          return(data.frame(file_name = d$file_name[1], major_peak = NA_real_, stringsAsFactors = FALSE))
+        }
+        best_non_reference <- non_reference[which.max(non_reference$area_fraction * non_reference$prominence), , drop = FALSE]
+        data.frame(file_name = d$file_name[1], major_peak = best_non_reference$peak_value, stringsAsFactors = FALSE)
+      })
+    )
+
+    chosen <- merge(chosen, control_major_tbl, by = "file_name", all.x = TRUE)
+    chosen$major_to_reference_ratio <- chosen$major_peak / chosen$peak_value
+
+    position_stability <- robust_scale(chosen$peak_log10)["scale"]
+    shape_stability <- sum(vapply(c("log_width", "local_cv", "scatter_shift"), function(feature) {
+      robust_scale(chosen[[feature]])["scale"]
+    }, numeric(1)))
+    coherence_2n <- robust_scale(log(subset(chosen, starting_ploidy == "2N")$major_to_reference_ratio))["scale"]
+    coherence_4n <- robust_scale(log(subset(chosen, starting_ploidy == "4N")$major_to_reference_ratio))["scale"]
+    lineage_separation <- median(log(subset(chosen, starting_ploidy == "4N")$major_to_reference_ratio), na.rm = TRUE) -
+      median(log(subset(chosen, starting_ploidy == "2N")$major_to_reference_ratio), na.rm = TRUE)
+    median_quality <- median(chosen$peak_quality, na.rm = TRUE)
+
+    data.frame(
+      chosen,
+      position_stability = position_stability,
+      shape_stability = shape_stability,
+      coherence_2n = coherence_2n,
+      coherence_4n = coherence_4n,
+      lineage_separation = lineage_separation,
+      median_quality = median_quality,
+      stringsAsFactors = FALSE
+    )
   }
+
+  combo_tbl <- do.call(
+    rbind,
+    lapply(seq_len(nrow(control_grid)), function(i) {
+      chosen <- evaluate_control_combo(control_grid[i, , drop = FALSE])
+      data.frame(
+        combo_id = i,
+        position_stability = chosen$position_stability[1],
+        shape_stability = chosen$shape_stability[1],
+        coherence_2n = chosen$coherence_2n[1],
+        coherence_4n = chosen$coherence_4n[1],
+        lineage_separation = chosen$lineage_separation[1],
+        median_quality = chosen$median_quality[1],
+        stringsAsFactors = FALSE
+      )
+    })
+  )
+
+  combo_tbl$rank_position <- rank(combo_tbl$position_stability, ties.method = "min")
+  combo_tbl$rank_shape <- rank(combo_tbl$shape_stability, ties.method = "min")
+  combo_tbl$rank_coherence_2n <- rank(combo_tbl$coherence_2n, ties.method = "min")
+  combo_tbl$rank_coherence_4n <- rank(combo_tbl$coherence_4n, ties.method = "min")
+  combo_tbl$rank_separation <- rank(-combo_tbl$lineage_separation, ties.method = "min")
+  combo_tbl$rank_quality <- rank(-combo_tbl$median_quality, ties.method = "min")
+  combo_tbl$combo_rank_sum <- rowSums(combo_tbl[, grepl("^rank_", names(combo_tbl)), drop = FALSE])
+
+  best_combo_id <- combo_tbl$combo_id[which.min(combo_tbl$combo_rank_sum)]
+  best_control_tbl <- evaluate_control_combo(control_grid[best_combo_id, , drop = FALSE])
+
+  template <- fit_reference_template(best_control_tbl, feature_cols)
+  scored_peaks <- score_reference_candidates(sample_peak_tbl, template)
+  control_scored_tbl <- score_reference_candidates(best_control_tbl, template)
+  distance_limit <- max(control_scored_tbl$reference_distance, na.rm = TRUE)
+  support_limit <- min(control_scored_tbl$reference_support, na.rm = TRUE)
 
   assigned_tbl <- do.call(
     rbind,
-    lapply(split(candidate_tbl, candidate_tbl$file_name), choose_one)
+    lapply(split(scored_peaks, scored_peaks$file_name), function(d) {
+      d <- d[order(d$reference_distance, -d$peak_quality, d$peak_value), , drop = FALSE]
+      chosen <- d[1, , drop = FALSE]
+      chosen$chicken_status <- if (chosen$reference_distance <= distance_limit && chosen$reference_support >= support_limit) {
+        "assigned"
+      } else {
+        "ambiguous"
+      }
+      chosen
+    })
   )
 
   list(
     assigned = assigned_tbl,
-    consensus_log10_center = control_center,
-    consensus_log10_scale = control_scale
+    scored_peaks = scored_peaks,
+    selected_controls = best_control_tbl,
+    control_scored_tbl = control_scored_tbl,
+    control_combo_tbl = combo_tbl,
+    template = template,
+    distance_limit = distance_limit,
+    support_limit = support_limit
   )
 }
 
@@ -506,8 +708,11 @@ sample_peak_tbl <- do.call(
         median_logFSC = numeric(0),
         median_logSSC = numeric(0),
         scatter_shift = numeric(0),
+        log_width = numeric(0),
+        local_cv = numeric(0),
+        peak_quality = numeric(0),
         pass = character(0),
-        chicken_candidate = logical(0),
+        peak_rank = numeric(0),
         stringsAsFactors = FALSE
       ))
     }
@@ -523,7 +728,7 @@ major_tbl <- classify_major_structure(sample_peak_tbl, chicken_tbl)
 analysis_tbl <- merge(sample_meta, sample_summary, by = "file_name", sort = FALSE, all.x = TRUE)
 analysis_tbl <- merge(
   analysis_tbl,
-  chicken_tbl[, c("file_name", "peak_value", "prominence", "area_fraction", "scatter_shift", "pass", "chicken_status", "consensus_distance")],
+  chicken_tbl[, c("file_name", "peak_value", "prominence", "area_fraction", "scatter_shift", "peak_quality", "reference_distance", "reference_support", "pass", "chicken_status")],
   by = "file_name",
   all.x = TRUE
 )
@@ -531,6 +736,9 @@ names(analysis_tbl)[names(analysis_tbl) == "peak_value"] <- "chicken_peak"
 names(analysis_tbl)[names(analysis_tbl) == "prominence"] <- "chicken_prominence"
 names(analysis_tbl)[names(analysis_tbl) == "area_fraction"] <- "chicken_area_fraction"
 names(analysis_tbl)[names(analysis_tbl) == "scatter_shift"] <- "chicken_scatter_shift"
+names(analysis_tbl)[names(analysis_tbl) == "peak_quality"] <- "chicken_peak_quality"
+names(analysis_tbl)[names(analysis_tbl) == "reference_distance"] <- "chicken_reference_distance"
+names(analysis_tbl)[names(analysis_tbl) == "reference_support"] <- "chicken_reference_support"
 names(analysis_tbl)[names(analysis_tbl) == "pass"] <- "chicken_detection_pass"
 
 analysis_tbl <- merge(
@@ -544,9 +752,14 @@ names(analysis_tbl)[names(analysis_tbl) == "prominence"] <- "major_peak_prominen
 names(analysis_tbl)[names(analysis_tbl) == "area_fraction"] <- "major_peak_area_fraction"
 names(analysis_tbl)[names(analysis_tbl) == "scatter_shift"] <- "major_peak_scatter_shift"
 
-analysis_tbl$major_to_chicken_ratio <- analysis_tbl$major_peak / analysis_tbl$chicken_peak
-analysis_tbl$qc_flag_low_events <- analysis_tbl$events_after_time < 2000
-analysis_tbl$qc_flag_low_retention <- with(analysis_tbl, retention_basic * retention_singlets * retention_time < 0.35)
+analysis_tbl$major_to_chicken_ratio <- ifelse(
+  analysis_tbl$chicken_status == "assigned" & is.finite(analysis_tbl$major_peak),
+  analysis_tbl$major_peak / analysis_tbl$chicken_peak,
+  NA_real_
+)
+analysis_tbl$qc_flag_low_events <- analysis_tbl$events_after_debris < 2000
+analysis_tbl$qc_flag_low_retention <- with(analysis_tbl, retention_basic * retention_singlets * retention_time * retention_debris < 0.35)
+analysis_tbl$qc_flag_debris_gate_unresolved <- analysis_tbl$debris_gate_status != "resolved"
 analysis_tbl$qc_flag_no_chicken <- !is.finite(analysis_tbl$chicken_peak)
 analysis_tbl$qc_flag_chicken_ambiguous <- is.na(analysis_tbl$chicken_status) | analysis_tbl$chicken_status != "assigned"
 analysis_tbl$qc_flag_no_major_peak <- !is.finite(analysis_tbl$major_peak)
@@ -559,10 +772,10 @@ analysis_tbl <- analysis_tbl[
 kable(
   analysis_tbl[, c(
     "sample_id", "starting_ploidy", "oxygen_condition",
-    "events_raw", "events_after_time", "peak_count_total",
+    "events_raw", "events_after_debris", "peak_count_total",
     "chicken_peak", "chicken_status", "major_peak",
     "major_to_chicken_ratio", "qc_flag_low_events",
-    "qc_flag_low_retention", "qc_flag_structure_unresolved"
+    "qc_flag_low_retention", "qc_flag_debris_gate_unresolved", "qc_flag_structure_unresolved"
   )],
   digits = 3,
   caption = "Per-sample QC and peak summary after conservative filtering, two-stage peak detection, and explicit chicken-reference classification."
@@ -574,9 +787,10 @@ kable(
 ```{r qc-overview-table}
 qc_overview <- analysis_tbl[, c(
   "sample_id", "starting_ploidy", "oxygen_condition",
-  "events_raw", "events_after_basic", "events_after_singlets", "events_after_time",
-  "retention_basic", "retention_singlets", "retention_time",
-  "qc_flag_low_events", "qc_flag_low_retention"
+  "events_raw", "events_after_basic", "events_after_singlets", "events_after_time", "events_after_debris",
+  "retention_basic", "retention_singlets", "retention_time", "retention_debris",
+  "debris_gate_status", "debris_cutoff",
+  "qc_flag_low_events", "qc_flag_low_retention", "qc_flag_debris_gate_unresolved"
 )]
 
 kable(
@@ -635,49 +849,59 @@ kable(
 
 # Chicken Reference Assessment
 
-The chicken-reference strategy is intentionally stricter than the previous
-workflow. A candidate chicken peak must satisfy all of the following:
+The chicken-reference strategy now treats the chicken compartment as a
+cross-sample calibration object rather than just a low-DNA peak. Following the
+literature already summarized in [`docs/literature.txt`](C:\Users\4473331\Documents\projects\023_ploidyFlow\docs\literature.txt),
+the workflow does three things differently:
 
-1. It is materially lower in DNA intensity than the dominant sample peak.
-2. It sits in a smaller-scatter compartment than the sample median, consistent
-   with a distinct internal reference population.
-3. It carries enough mass to represent a real subpopulation rather than a small
-   shoulder or noise feature.
-4. It is reasonably consistent with the control-sample chicken consensus on the
-   log scale.
+1. It adds an explicit debris gate by locating the left boundary of the first
+   resolved low-scatter nuclear peak and excluding events below that boundary.
+2. It uses the control samples to define a multifeature reference template
+   based on DNA position, peak width, local CV, scatter profile, and a
+   peak-quality term that rewards sharp, prominent peaks.
+3. It assigns the chicken peak in each sample only if the best candidate
+   behaves like the control-derived calibration object under leave-one-out
+   control validation.
 
-If those conditions are not met, the workflow leaves the chicken assignment
-ambiguous instead of forcing a label.
+This remains conservative: if the best candidate does not look sufficiently
+reference-like, the sample is left ambiguous.
 
 ```{r chicken-consensus-text, results='asis'}
-if (is.finite(chicken_result$consensus_log10_center)) {
-  cat(
-    sprintf(
+cat(
+  sprintf(
       paste(
-        "The control-anchored chicken-reference consensus is centered at approximately %.0f DNA-channel units",
-        "(log10 center %.3f, robust scale %.3f).",
-        "Distances from this consensus are used as one component of per-sample chicken assignment."
+        "The selected control-reference model sets a control-calibrated acceptance envelope of distance <= %.3f.",
+        "Support is reported for ranking within each sample, but assignment is driven primarily by the control-derived distance envelope.",
+        "Candidates outside that envelope are left ambiguous."
       ),
-      10^chicken_result$consensus_log10_center,
-      chicken_result$consensus_log10_center,
-      chicken_result$consensus_log10_scale
-    )
+      chicken_result$distance_limit,
+      chicken_result$support_limit
   )
-} else {
-  cat("A stable control-based chicken-reference consensus could not be estimated from the current data.")
-}
+)
+```
+
+```{r control-reference-table}
+control_reference_tbl <- chicken_result$selected_controls[, c(
+  "file_name", "starting_ploidy", "peak_value", "major_peak",
+  "major_to_reference_ratio", "log_width", "local_cv",
+  "scatter_shift", "peak_quality"
+)]
+
+kable(
+  control_reference_tbl,
+  digits = 3,
+  caption = "Control-sample peaks selected as the reference template. These control assignments are used to define the allowable reference-like feature envelope."
+)
 ```
 
 ```{r chicken-reference-plot}
 chicken_plot_tbl <- merge(
-  sample_peak_tbl,
+  chicken_result$scored_peaks,
   sample_meta[, c("file_name", "sample_id", "starting_ploidy", "oxygen_condition")],
   by = "file_name"
 )
 
 chicken_plot_tbl$peak_role <- "Other peak"
-chicken_plot_tbl$peak_role[chicken_plot_tbl$chicken_candidate] <- "Chicken candidate"
-
 if (nrow(chicken_tbl) > 0) {
   chosen_keys <- paste(chicken_tbl$file_name, signif(chicken_tbl$peak_value, 8))
   plot_keys <- paste(chicken_plot_tbl$file_name, signif(chicken_plot_tbl$peak_value, 8))
@@ -686,23 +910,21 @@ if (nrow(chicken_tbl) > 0) {
 
 ggplot(
   chicken_plot_tbl,
-  aes(x = peak_value, y = scatter_shift, color = peak_role, shape = oxygen_condition)
+  aes(x = reference_distance, y = peak_quality, color = peak_role, shape = oxygen_condition)
 ) +
-  geom_hline(yintercept = -0.4, linetype = "dotted", color = "grey45") +
+  geom_vline(xintercept = chicken_result$distance_limit, linetype = "dotted", color = "grey45") +
   geom_point(aes(size = area_fraction), alpha = 0.85) +
-  scale_x_log10(labels = label_number()) +
   scale_color_manual(
     values = c(
       "Other peak" = "#6c757d",
-      "Chicken candidate" = "#e9c46a",
       "Assigned chicken" = "#d62828"
     )
   ) +
   labs(
     title = "Chicken-reference candidates across samples",
-    subtitle = "The assigned chicken peak must be both low-DNA and low-scatter relative to the sample, then checked against the control consensus",
-    x = "Peak position on DNA channel",
-    y = "Scatter shift relative to sample median FSC",
+    subtitle = "Candidates are judged by similarity to the control-derived reference template rather than by a fixed low-DNA rule",
+    x = "Reference-template distance",
+    y = "Peak quality score",
     color = "Peak class",
     shape = "Oxygen condition",
     size = "Peak mass"
@@ -715,7 +937,8 @@ chicken_summary_tbl <- analysis_tbl[, c(
   "sample_id", "starting_ploidy", "oxygen_condition",
   "chicken_peak", "chicken_status", "chicken_detection_pass",
   "chicken_area_fraction", "chicken_prominence",
-  "chicken_scatter_shift", "consensus_distance"
+  "chicken_scatter_shift", "chicken_peak_quality",
+  "chicken_reference_distance", "chicken_reference_support"
 )]
 
 kable(
@@ -855,20 +1078,24 @@ ggplot(plot_tbl, aes(x = oxygen_condition, y = peak_value, fill = peak_type)) +
 # Technical Variability and Control Sanity Checks
 
 ```{r technical-variability-table}
-control_tbl <- subset(analysis_tbl, oxygen_condition == "C")
+control_tbl <- subset(analysis_tbl, oxygen_condition == "C" & chicken_status == "assigned")
 
 technical_variability_tbl <- data.frame(
   metric = c(
     "Chicken peak CV among C samples",
     "Major peak CV among C samples",
     "2N control ratio median",
-    "4N control ratio median"
+    "4N control ratio median",
+    "Max control-template distance",
+    "Minimum support reported"
   ),
   value = c(
     sd(control_tbl$chicken_peak, na.rm = TRUE) / mean(control_tbl$chicken_peak, na.rm = TRUE),
     sd(control_tbl$major_peak, na.rm = TRUE) / mean(control_tbl$major_peak, na.rm = TRUE),
     median(subset(control_tbl, starting_ploidy == "2N")$major_to_chicken_ratio, na.rm = TRUE),
-    median(subset(control_tbl, starting_ploidy == "4N")$major_to_chicken_ratio, na.rm = TRUE)
+    median(subset(control_tbl, starting_ploidy == "4N")$major_to_chicken_ratio, na.rm = TRUE),
+    chicken_result$distance_limit,
+    chicken_result$support_limit
   ),
   stringsAsFactors = FALSE
 )
@@ -915,12 +1142,14 @@ ambiguity_tbl <- subset(
   analysis_tbl,
   qc_flag_low_events |
     qc_flag_low_retention |
+    qc_flag_debris_gate_unresolved |
     qc_flag_no_chicken |
     qc_flag_chicken_ambiguous |
     qc_flag_no_major_peak
 )[, c(
   "sample_id", "starting_ploidy", "oxygen_condition",
   "qc_flag_low_events", "qc_flag_low_retention",
+  "qc_flag_debris_gate_unresolved",
   "qc_flag_no_chicken", "qc_flag_chicken_ambiguous",
   "qc_flag_no_major_peak"
 )]
