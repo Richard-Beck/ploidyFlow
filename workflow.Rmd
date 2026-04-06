@@ -1,0 +1,405 @@
+---
+title: "Ploidy-Oxygen Workflow: Data Processing and Initial Modelling"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "./")
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  out.width = "100%"
+)
+```
+
+# Workflow Goal
+
+This document turns the raw `.fcs` files into a first-pass set of quality-controlled
+DNA-content summaries. The immediate objective is to identify the internal chicken
+reference peak and the tumor G0/G1 peak in each sample, summarize their relative
+positions, and test whether oxygen condition shifts the normalized DNA-content signal.
+
+# Input Configuration
+
+```{r libraries}
+library(flowCore)
+library(ggplot2)
+library(knitr)
+library(scales)
+```
+
+```{r input-config}
+path <- "data/Hypoxia_SUM159"
+stopifnot(dir.exists(path))
+
+dna_channel <- "X450.Violet.C.A"
+scatter_channels <- c("FSC.A", "SSC.A", "FSC.H")
+
+ff <- list.files(path, pattern = "\\.fcs$", full.names = FALSE)
+stopifnot(length(ff) > 0)
+```
+
+# Sample Metadata Parsing
+
+```{r sample-metadata}
+parse_sample_name <- function(filename) {
+  core <- sub("^Sample_", "", filename)
+  core <- sub("\\.fcs$", "", core)
+  parts <- strsplit(core, "_", fixed = TRUE)[[1]]
+
+  replicate_raw <- parts[4]
+  replicate_id <- sub("_+$", "", replicate_raw)
+
+  data.frame(
+    file_name = filename,
+    sample_id = core,
+    cell_line = parts[1],
+    starting_ploidy = parts[2],
+    oxygen_condition = parts[3],
+    replicate_id = replicate_id,
+    stringsAsFactors = FALSE
+  )
+}
+
+sample_meta <- do.call(
+  rbind,
+  lapply(ff, parse_sample_name)
+)
+
+sample_meta$starting_ploidy <- factor(sample_meta$starting_ploidy, levels = c("2N", "4N"))
+sample_meta$oxygen_condition <- factor(sample_meta$oxygen_condition, levels = c("C", "O1", "O2"))
+
+kable(sample_meta, caption = "Parsed sample metadata from FCS filenames.")
+```
+
+# Flow Import and Quality Control
+
+```{r helper-functions}
+read_flow_table <- function(file_name) {
+  fcs <- read.FCS(file.path(path, file_name))
+  dfi <- as.data.frame(exprs(fcs))
+  colnames(dfi) <- make.names(colnames(dfi))
+  dfi
+}
+
+apply_qc_gate <- function(dfi) {
+  keep <- rep(TRUE, nrow(dfi))
+
+  for (channel in c(dna_channel, scatter_channels)) {
+    x <- dfi[[channel]]
+    keep <- keep & is.finite(x)
+  }
+
+  for (channel in c(dna_channel, "FSC.A", "SSC.A")) {
+    x <- dfi[[channel]]
+    bounds <- quantile(x, probs = c(0.01, 0.99), na.rm = TRUE)
+    keep <- keep & x >= bounds[1] & x <= bounds[2]
+  }
+
+  singlet_ratio <- dfi$FSC.H / pmax(dfi$FSC.A, 1)
+  ratio_bounds <- quantile(singlet_ratio[is.finite(singlet_ratio)], probs = c(0.05, 0.95), na.rm = TRUE)
+  keep <- keep & is.finite(singlet_ratio) & singlet_ratio >= ratio_bounds[1] & singlet_ratio <= ratio_bounds[2]
+
+  dfi[keep, , drop = FALSE]
+}
+
+find_density_peaks <- function(x, n = 4) {
+  x <- x[is.finite(x)]
+  if (length(unique(x)) < 2) {
+    return(data.frame(x = numeric(0), y = numeric(0)))
+  }
+
+  dens <- density(x, n = 2048, adjust = 1.2)
+  idx <- which(diff(sign(diff(dens$y))) == -2) + 1
+  peaks <- data.frame(x = dens$x[idx], y = dens$y[idx])
+  peaks <- peaks[order(peaks$y, decreasing = TRUE), , drop = FALSE]
+
+  if (nrow(peaks) == 0) {
+    return(peaks)
+  }
+
+  head(peaks, n)
+}
+
+summarize_sample <- function(file_name) {
+  raw_df <- read_flow_table(file_name)
+  qc_df <- apply_qc_gate(raw_df)
+
+  peaks <- find_density_peaks(qc_df[[dna_channel]], n = 4)
+  peaks <- peaks[order(peaks$x), , drop = FALSE]
+
+  chicken_peak <- if (nrow(peaks) >= 1) peaks$x[1] else NA_real_
+  tumor_g1_peak <- if (nrow(peaks) >= 2) peaks$x[2] else NA_real_
+  secondary_peak <- if (nrow(peaks) >= 3) peaks$x[3] else NA_real_
+  normalized_ratio <- tumor_g1_peak / chicken_peak
+
+  data.frame(
+    file_name = file_name,
+    events_raw = nrow(raw_df),
+    events_qc = nrow(qc_df),
+    qc_retention = nrow(qc_df) / nrow(raw_df),
+    peak_count = nrow(peaks),
+    chicken_peak = chicken_peak,
+    tumor_g1_peak = tumor_g1_peak,
+    secondary_peak = secondary_peak,
+    tumor_to_chicken_ratio = normalized_ratio,
+    qc_flag_low_events = nrow(qc_df) < 1000,
+    qc_flag_missing_peaks = nrow(peaks) < 2,
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+```{r flow-import}
+flow_raw <- setNames(lapply(ff, read_flow_table), ff)
+flow_qc <- setNames(lapply(flow_raw, apply_qc_gate), ff)
+
+qc_overview <- do.call(
+  rbind,
+  lapply(names(flow_raw), function(file_name) {
+    data.frame(
+      file_name = file_name,
+      events_raw = nrow(flow_raw[[file_name]]),
+      events_qc = nrow(flow_qc[[file_name]]),
+      qc_retention = nrow(flow_qc[[file_name]]) / nrow(flow_raw[[file_name]])
+    )
+  })
+)
+
+kable(qc_overview, digits = 3, caption = "Event counts before and after a conservative exploratory QC gate.")
+```
+
+# Quality-Control Visualizations
+
+```{r qc-example-plot}
+example_file <- sample_meta$file_name[1]
+example_raw <- flow_raw[[example_file]]
+example_qc <- flow_qc[[example_file]]
+
+ggplot(example_raw, aes(x = FSC.A, y = SSC.A)) +
+  geom_point(alpha = 0.08, size = 0.3, color = "#9c6644") +
+  geom_point(
+    data = example_qc,
+    aes(x = FSC.A, y = SSC.A),
+    alpha = 0.08,
+    size = 0.3,
+    color = "#386641"
+  ) +
+  labs(
+    title = paste("QC overlay for", example_file),
+    subtitle = "Raw events in brown, retained events in green",
+    x = "FSC-A",
+    y = "SSC-A"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+# Peak Detection on DNA Channel
+
+```{r peak-summary}
+peak_summary <- do.call(
+  rbind,
+  lapply(ff, summarize_sample)
+)
+
+analysis_tbl <- merge(sample_meta, peak_summary, by = "file_name", sort = FALSE)
+analysis_tbl <- analysis_tbl[order(analysis_tbl$starting_ploidy, analysis_tbl$oxygen_condition, analysis_tbl$replicate_id), ]
+
+kable(
+  analysis_tbl,
+  digits = 3,
+  caption = "Per-sample DNA peak summary after QC filtering and heuristic density-peak calling."
+)
+```
+
+```{r example-density}
+example_peaks <- find_density_peaks(example_qc[[dna_channel]], n = 4)
+
+ggplot(example_qc, aes(x = .data[[dna_channel]])) +
+  geom_density(fill = "#8ecae6", alpha = 0.5, color = "#023047", linewidth = 0.8) +
+  geom_vline(
+    data = example_peaks,
+    aes(xintercept = x),
+    color = "#d00000",
+    linetype = "dashed",
+    linewidth = 0.7
+  ) +
+  labs(
+    title = paste("DNA density with called peaks for", example_file),
+    subtitle = "Dashed lines mark the strongest local maxima",
+    x = "450-Violet C-A",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r all-sample-density-grid, fig.height=14, fig.width=16}
+sample_order <- analysis_tbl$file_name
+
+density_list <- lapply(sample_order, function(file_name) {
+  dens <- density(flow_qc[[file_name]][[dna_channel]], n = 2048, adjust = 1.2)
+  data.frame(
+    file_name = file_name,
+    dna_value = dens$x,
+    density_value = dens$y
+  )
+})
+
+peak_list <- lapply(sample_order, function(file_name) {
+  peaks <- find_density_peaks(flow_qc[[file_name]][[dna_channel]], n = 4)
+  if (nrow(peaks) == 0) {
+    return(data.frame(
+      file_name = character(0),
+      peak_position = numeric(0),
+      peak_height = numeric(0)
+    ))
+  }
+
+  data.frame(
+    file_name = file_name,
+    peak_position = peaks$x,
+    peak_height = peaks$y
+  )
+})
+
+sample_density_tbl <- do.call(rbind, density_list)
+sample_peak_tbl <- do.call(rbind, peak_list)
+
+sample_density_tbl$file_name <- factor(sample_density_tbl$file_name, levels = sample_order)
+sample_peak_tbl$file_name <- factor(sample_peak_tbl$file_name, levels = sample_order)
+
+facet_labels <- setNames(analysis_tbl$sample_id, analysis_tbl$file_name)
+
+ggplot(sample_density_tbl, aes(x = dna_value, y = density_value)) +
+  geom_area(fill = "#8ecae6", alpha = 0.5) +
+  geom_line(color = "#023047", linewidth = 0.5) +
+  geom_vline(
+    data = sample_peak_tbl,
+    aes(xintercept = peak_position),
+    color = "#d00000",
+    linetype = "dashed",
+    linewidth = 0.4
+  ) +
+  facet_wrap(
+    ~file_name,
+    ncol = 4,
+    nrow = 5,
+    scales = "free_y",
+    labeller = as_labeller(facet_labels)
+  ) +
+  labs(
+    title = "DNA intensity with called peaks for every flow sample",
+    subtitle = "Each panel shows the QC-filtered DNA density; dashed lines mark called local maxima",
+    x = "450-Violet C-A",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    strip.text = element_text(size = 8),
+    panel.grid.minor = element_blank()
+  )
+```
+
+# Summary Plots
+
+```{r summary-plots}
+ggplot(
+  analysis_tbl,
+  aes(x = oxygen_condition, y = tumor_to_chicken_ratio, color = starting_ploidy)
+) +
+  geom_point(position = position_jitter(width = 0.08, height = 0), size = 2.4, alpha = 0.9) +
+  stat_summary(aes(group = starting_ploidy), fun = mean, geom = "line", linewidth = 0.8) +
+  facet_wrap(~starting_ploidy, nrow = 1) +
+  scale_color_manual(values = c("2N" = "#1d3557", "4N" = "#d62828")) +
+  scale_y_continuous(labels = number_format(accuracy = 0.01)) +
+  labs(
+    title = "Normalized tumor DNA content across oxygen conditions",
+    x = "Oxygen condition",
+    y = "Tumor G0/G1 peak divided by chicken reference peak",
+    color = "Starting ploidy"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+```{r summary-plot-peaks}
+plot_tbl <- rbind(
+  data.frame(
+    sample_id = analysis_tbl$sample_id,
+    starting_ploidy = analysis_tbl$starting_ploidy,
+    oxygen_condition = analysis_tbl$oxygen_condition,
+    peak_type = "Chicken reference",
+    peak_value = analysis_tbl$chicken_peak
+  ),
+  data.frame(
+    sample_id = analysis_tbl$sample_id,
+    starting_ploidy = analysis_tbl$starting_ploidy,
+    oxygen_condition = analysis_tbl$oxygen_condition,
+    peak_type = "Tumor G0/G1",
+    peak_value = analysis_tbl$tumor_g1_peak
+  )
+)
+
+ggplot(plot_tbl, aes(x = oxygen_condition, y = peak_value, fill = peak_type)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.08, dodge.width = 0.75), size = 1.8, alpha = 0.9) +
+  facet_wrap(~starting_ploidy, nrow = 1) +
+  scale_fill_manual(values = c("Chicken reference" = "#f4a261", "Tumor G0/G1" = "#2a9d8f")) +
+  labs(
+    title = "Peak positions by oxygen condition",
+    x = "Oxygen condition",
+    y = "Peak position on DNA channel",
+    fill = "Peak type"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+# Initial Model
+
+```{r initial-model}
+model_tbl <- subset(
+  analysis_tbl,
+  is.finite(tumor_to_chicken_ratio) & !qc_flag_missing_peaks
+)
+
+initial_model <- lm(
+  tumor_to_chicken_ratio ~ starting_ploidy * oxygen_condition,
+  data = model_tbl
+)
+
+model_coef <- data.frame(
+  term = names(coef(initial_model)),
+  estimate = unname(coef(initial_model)),
+  stringsAsFactors = FALSE
+)
+
+kable(
+  model_coef,
+  digits = 4,
+  caption = "Coefficient table from an exploratory linear model of normalized tumor DNA content."
+)
+```
+
+```{r model-summary-text, results='asis'}
+cat(
+  sprintf(
+    paste(
+      "The exploratory model was fit on %s samples with usable peak calls.",
+      "This should be treated as a workflow check rather than a final biological conclusion."
+    ),
+    nrow(model_tbl)
+  )
+)
+```
+
+# Next Steps
+
+1. Replace the heuristic QC gate with explicit debris and singlet gates derived from the instrument channels and known control populations.
+2. Validate the peak annotations against manual inspection for a subset of samples before using the ratios in downstream inference.
+3. Extend the model to work on full distributions rather than just the dominant G0/G1 peak, especially if S-phase and 4N fractions become biologically important.
