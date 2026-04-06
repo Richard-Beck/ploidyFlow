@@ -20,10 +20,30 @@ knitr::opts_chunk$set(
 
 # Workflow Goal
 
-This document turns the raw `.fcs` files into a first-pass set of quality-controlled
-DNA-content summaries. The immediate objective is to identify the internal chicken
-reference peak and the tumor G0/G1 peak in each sample, summarize their relative
-positions, and test whether oxygen condition shifts the normalized DNA-content signal.
+This workflow is an assay-characterization and structure-recovery exercise, not
+yet a downstream biological hypothesis test. The goal is to learn as much as
+possible from the flow data in isolation while keeping the interpretation
+conservative.
+
+The central questions at this stage are:
+
+1. How does this assay behave across samples and runs?
+2. How much variation appears technical rather than biological?
+3. Which automated QC, gating, and peak-detection strategies are defensible?
+4. What population structure is robustly recoverable from the flow DNA signal
+   alone?
+5. Where does the flow data stop supporting an unambiguous interpretation?
+
+The workflow is anchored by three assumptions:
+
+1. The internal chicken reference is expected to be the same biological
+   population in every sample, so its between-sample variation is treated as
+   primarily technical unless the data argue otherwise.
+2. The 2N and 4N control lineages provide an additional layer of expected
+   structure and serve as an important sanity check on recoverable peak
+   architecture.
+3. O1 and O2 samples may contain real ploidy shifts, so they are analyzed more
+   cautiously and are not imposed as rigid reference structure.
 
 # Input Configuration
 
@@ -40,6 +60,8 @@ stopifnot(dir.exists(path))
 
 dna_channel <- "X450.Violet.C.A"
 scatter_channels <- c("FSC.A", "SSC.A", "FSC.H")
+time_channel <- "Time"
+saturation_cap <- 262143
 
 ff <- list.files(path, pattern = "\\.fcs$", full.names = FALSE)
 stopifnot(length(ff) > 0)
@@ -67,18 +89,35 @@ parse_sample_name <- function(filename) {
   )
 }
 
-sample_meta <- do.call(
-  rbind,
-  lapply(ff, parse_sample_name)
-)
-
+sample_meta <- do.call(rbind, lapply(ff, parse_sample_name))
 sample_meta$starting_ploidy <- factor(sample_meta$starting_ploidy, levels = c("2N", "4N"))
 sample_meta$oxygen_condition <- factor(sample_meta$oxygen_condition, levels = c("C", "O1", "O2"))
 
 kable(sample_meta, caption = "Parsed sample metadata from FCS filenames.")
 ```
 
-# Flow Import and Quality Control
+# Analysis Strategy
+
+This workflow uses a deliberately conservative sequence:
+
+1. Import all events and apply minimal hard exclusions only for non-finite,
+   non-positive, and near-saturated events.
+2. Apply a singlet-oriented gate using the robust relationship between `FSC-A`
+   and `FSC-H` instead of trimming the dominant scatter cloud.
+3. Remove severe time-instability segments when event counts or median DNA
+   signal drift sharply across acquisition.
+4. Detect DNA peaks on the log-intensity scale using smoothed density estimates,
+   local maxima, prominence filtering, minimum mass filtering, and minimum
+   separation.
+5. Detect low-DNA candidate peaks with a second, more permissive pass so the
+   chicken reference is not discarded simply because it is smaller and less
+   dominant than the tumor compartment.
+6. Build a consensus chicken-reference expectation from control samples and use
+   that expectation to classify or withhold per-sample chicken assignments.
+7. Summarize what can be recovered robustly, and explicitly label unresolved or
+   ambiguous samples rather than forcing a chicken + tumor G0/G1 interpretation.
+
+# Helper Functions
 
 ```{r helper-functions}
 read_flow_table <- function(file_name) {
@@ -88,153 +127,629 @@ read_flow_table <- function(file_name) {
   dfi
 }
 
-apply_qc_gate <- function(dfi) {
-  keep <- rep(TRUE, nrow(dfi))
+robust_scale <- function(x) {
+  x <- x[is.finite(x)]
+  center <- median(x, na.rm = TRUE)
+  scale <- mad(x, constant = 1.4826, na.rm = TRUE)
 
-  for (channel in c(dna_channel, scatter_channels)) {
-    x <- dfi[[channel]]
-    keep <- keep & is.finite(x)
+  if (!is.finite(scale) || scale <= 0) {
+    scale <- IQR(x, na.rm = TRUE) / 1.349
+  }
+  if (!is.finite(scale) || scale <= 0) {
+    scale <- sd(x, na.rm = TRUE)
+  }
+  if (!is.finite(scale) || scale <= 0) {
+    scale <- 1
   }
 
-  for (channel in c(dna_channel, "FSC.A", "SSC.A")) {
-    x <- dfi[[channel]]
-    bounds <- quantile(x, probs = c(0.01, 0.99), na.rm = TRUE)
-    keep <- keep & x >= bounds[1] & x <= bounds[2]
-  }
-
-  singlet_ratio <- dfi$FSC.H / pmax(dfi$FSC.A, 1)
-  ratio_bounds <- quantile(singlet_ratio[is.finite(singlet_ratio)], probs = c(0.05, 0.95), na.rm = TRUE)
-  keep <- keep & is.finite(singlet_ratio) & singlet_ratio >= ratio_bounds[1] & singlet_ratio <= ratio_bounds[2]
-
-  dfi[keep, , drop = FALSE]
+  c(center = center, scale = scale)
 }
 
-find_density_peaks <- function(x, n = 4) {
-  x <- x[is.finite(x)]
-  if (length(unique(x)) < 2) {
-    return(data.frame(x = numeric(0), y = numeric(0)))
+apply_qc_filters <- function(dfi) {
+  required_channels <- c(dna_channel, scatter_channels, time_channel)
+
+  keep_basic <- complete.cases(dfi[, required_channels]) &
+    dfi[[dna_channel]] > 0 &
+    dfi$FSC.A > 0 &
+    dfi$FSC.H > 0 &
+    dfi$SSC.A > 0
+
+  sat_threshold <- saturation_cap * 0.995
+  keep_basic <- keep_basic &
+    dfi[[dna_channel]] < sat_threshold &
+    dfi$FSC.A < sat_threshold &
+    dfi$FSC.H < sat_threshold &
+    dfi$SSC.A < sat_threshold
+
+  qc_df <- dfi[keep_basic, , drop = FALSE]
+  if (nrow(qc_df) < 100) {
+    return(list(
+      data = qc_df,
+      metrics = data.frame(
+        events_raw = nrow(dfi),
+        events_after_basic = nrow(qc_df),
+        events_after_singlets = nrow(qc_df),
+        events_after_time = nrow(qc_df),
+        retention_basic = nrow(qc_df) / nrow(dfi),
+        retention_singlets = 1,
+        retention_time = 1,
+        stringsAsFactors = FALSE
+      )
+    ))
   }
 
-  dens <- density(x, n = 2048, adjust = 1.2)
-  idx <- which(diff(sign(diff(dens$y))) == -2) + 1
-  peaks <- data.frame(x = dens$x[idx], y = dens$y[idx])
-  peaks <- peaks[order(peaks$y, decreasing = TRUE), , drop = FALSE]
+  singlet_fit <- lm(log10(FSC.H) ~ log10(FSC.A), data = qc_df)
+  singlet_resid <- resid(singlet_fit)
+  singlet_stats <- robust_scale(singlet_resid)
+  keep_singlets <- abs((singlet_resid - singlet_stats["center"]) / singlet_stats["scale"]) <= 3.5
+
+  qc_df <- qc_df[keep_singlets, , drop = FALSE]
+  if (nrow(qc_df) < 100) {
+    return(list(
+      data = qc_df,
+      metrics = data.frame(
+        events_raw = nrow(dfi),
+        events_after_basic = sum(keep_basic),
+        events_after_singlets = nrow(qc_df),
+        events_after_time = nrow(qc_df),
+        retention_basic = sum(keep_basic) / nrow(dfi),
+        retention_singlets = nrow(qc_df) / max(sum(keep_basic), 1),
+        retention_time = 1,
+        stringsAsFactors = FALSE
+      )
+    ))
+  }
+
+  time_breaks <- unique(quantile(qc_df[[time_channel]], probs = seq(0, 1, length.out = 21), na.rm = TRUE))
+  keep_time <- rep(TRUE, nrow(qc_df))
+
+  if (length(time_breaks) > 2) {
+    time_bin <- cut(qc_df[[time_channel]], breaks = time_breaks, include.lowest = TRUE)
+    bin_counts <- tapply(qc_df[[dna_channel]], time_bin, length)
+    bin_medians <- tapply(log10(qc_df[[dna_channel]]), time_bin, median, na.rm = TRUE)
+
+    count_stats <- robust_scale(log10(as.numeric(bin_counts)))
+    median_stats <- robust_scale(as.numeric(bin_medians))
+
+    good_bins <- abs((log10(as.numeric(bin_counts)) - count_stats["center"]) / count_stats["scale"]) <= 3 &
+      abs((as.numeric(bin_medians) - median_stats["center"]) / median_stats["scale"]) <= 3
+
+    keep_time <- good_bins[as.integer(time_bin)]
+    keep_time[is.na(keep_time)] <- FALSE
+  }
+
+  qc_time_df <- qc_df[keep_time, , drop = FALSE]
+
+  list(
+    data = qc_time_df,
+    metrics = data.frame(
+      events_raw = nrow(dfi),
+      events_after_basic = sum(keep_basic),
+      events_after_singlets = nrow(qc_df),
+      events_after_time = nrow(qc_time_df),
+      retention_basic = sum(keep_basic) / nrow(dfi),
+      retention_singlets = nrow(qc_df) / max(sum(keep_basic), 1),
+      retention_time = nrow(qc_time_df) / max(nrow(qc_df), 1),
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+find_density_peaks <- function(x, adjust = 1.4, min_prom_frac = 0.06, min_area = 0.01, min_sep_log10 = 0.08) {
+  x <- x[is.finite(x) & x > 0]
+  lx <- log10(x)
+
+  if (length(unique(round(lx, 4))) < 20) {
+    return(data.frame())
+  }
+
+  dens <- density(lx, n = 4096, adjust = adjust)
+  peak_idx <- which(diff(sign(diff(dens$y))) == -2) + 1
+  valley_idx <- which(diff(sign(diff(dens$y))) == 2) + 1
+
+  if (length(peak_idx) == 0) {
+    return(data.frame())
+  }
+
+  peaks <- lapply(peak_idx, function(idx) {
+    left_valley <- if (any(valley_idx < idx)) tail(valley_idx[valley_idx < idx], 1) else 1
+    right_valley <- if (any(valley_idx > idx)) head(valley_idx[valley_idx > idx], 1) else length(dens$x)
+    baseline <- max(dens$y[left_valley], dens$y[right_valley])
+
+    data.frame(
+      peak_log10 = dens$x[idx],
+      peak_value = 10^dens$x[idx],
+      density_height = dens$y[idx],
+      prominence = dens$y[idx] - baseline,
+      left_value = 10^dens$x[left_valley],
+      right_value = 10^dens$x[right_valley],
+      area_fraction = mean(x >= 10^dens$x[left_valley] & x <= 10^dens$x[right_valley]),
+      stringsAsFactors = FALSE
+    )
+  })
+
+  peaks <- do.call(rbind, peaks)
+  peaks <- peaks[
+    peaks$prominence >= max(dens$y) * min_prom_frac &
+      peaks$area_fraction >= min_area,
+    ,
+    drop = FALSE
+  ]
 
   if (nrow(peaks) == 0) {
     return(peaks)
   }
 
-  head(peaks, n)
+  peaks <- peaks[order(peaks$density_height, decreasing = TRUE), , drop = FALSE]
+  keep <- logical(nrow(peaks))
+  chosen <- numeric(0)
+
+  for (i in seq_len(nrow(peaks))) {
+    if (length(chosen) == 0 || all(abs(peaks$peak_log10[i] - chosen) >= min_sep_log10)) {
+      keep[i] <- TRUE
+      chosen <- c(chosen, peaks$peak_log10[i])
+    }
+  }
+
+  peaks <- peaks[keep, , drop = FALSE]
+  peaks[order(peaks$peak_value), , drop = FALSE]
 }
 
-summarize_sample <- function(file_name) {
+annotate_peaks <- function(qc_df, peaks, pass_label) {
+  if (nrow(peaks) == 0) {
+    peaks$pass <- character(0)
+    return(peaks)
+  }
+
+  overall_logfsc <- log10(qc_df$FSC.A)
+  overall_center <- median(overall_logfsc, na.rm = TRUE)
+  overall_iqr <- IQR(overall_logfsc, na.rm = TRUE)
+  if (!is.finite(overall_iqr) || overall_iqr <= 0) {
+    overall_iqr <- 1
+  }
+
+  peaks$median_logFSC <- NA_real_
+  peaks$median_logSSC <- NA_real_
+  peaks$scatter_shift <- NA_real_
+  peaks$pass <- pass_label
+
+  for (i in seq_len(nrow(peaks))) {
+    in_window <- qc_df[[dna_channel]] >= peaks$left_value[i] & qc_df[[dna_channel]] <= peaks$right_value[i]
+    sub_df <- qc_df[in_window, , drop = FALSE]
+    peaks$median_logFSC[i] <- median(log10(sub_df$FSC.A), na.rm = TRUE)
+    peaks$median_logSSC[i] <- median(log10(sub_df$SSC.A), na.rm = TRUE)
+    peaks$scatter_shift[i] <- (peaks$median_logFSC[i] - overall_center) / overall_iqr
+  }
+
+  peaks
+}
+
+merge_peak_sets <- function(strict_peaks, permissive_peaks) {
+  if (nrow(strict_peaks) == 0 && nrow(permissive_peaks) == 0) {
+    return(data.frame())
+  }
+
+  all_peaks <- rbind(strict_peaks, permissive_peaks)
+  all_peaks <- all_peaks[order(all_peaks$peak_value, -all_peaks$prominence), , drop = FALSE]
+
+  keep <- rep(TRUE, nrow(all_peaks))
+  for (i in seq_len(nrow(all_peaks))) {
+    if (!keep[i]) {
+      next
+    }
+    close_idx <- which(
+      seq_len(nrow(all_peaks)) > i &
+        abs(all_peaks$peak_log10 - all_peaks$peak_log10[i]) < 0.05
+    )
+    keep[close_idx] <- FALSE
+  }
+
+  all_peaks[keep, , drop = FALSE]
+}
+
+analyze_sample <- function(file_name) {
   raw_df <- read_flow_table(file_name)
-  qc_df <- apply_qc_gate(raw_df)
+  qc_result <- apply_qc_filters(raw_df)
+  qc_df <- qc_result$data
+  qc_metrics <- qc_result$metrics
 
-  peaks <- find_density_peaks(qc_df[[dna_channel]], n = 4)
-  peaks <- peaks[order(peaks$x), , drop = FALSE]
-
-  chicken_peak <- if (nrow(peaks) >= 1) peaks$x[1] else NA_real_
-  tumor_g1_peak <- if (nrow(peaks) >= 2) peaks$x[2] else NA_real_
-  secondary_peak <- if (nrow(peaks) >= 3) peaks$x[3] else NA_real_
-  normalized_ratio <- tumor_g1_peak / chicken_peak
-
-  data.frame(
-    file_name = file_name,
-    events_raw = nrow(raw_df),
-    events_qc = nrow(qc_df),
-    qc_retention = nrow(qc_df) / nrow(raw_df),
-    peak_count = nrow(peaks),
-    chicken_peak = chicken_peak,
-    tumor_g1_peak = tumor_g1_peak,
-    secondary_peak = secondary_peak,
-    tumor_to_chicken_ratio = normalized_ratio,
-    qc_flag_low_events = nrow(qc_df) < 1000,
-    qc_flag_missing_peaks = nrow(peaks) < 2,
-    stringsAsFactors = FALSE
+  strict_peaks <- annotate_peaks(
+    qc_df,
+    find_density_peaks(qc_df[[dna_channel]], adjust = 1.4, min_prom_frac = 0.06, min_area = 0.01, min_sep_log10 = 0.08),
+    pass_label = "strict"
   )
+
+  permissive_peaks <- annotate_peaks(
+    qc_df,
+    find_density_peaks(qc_df[[dna_channel]], adjust = 1.8, min_prom_frac = 0.03, min_area = 0.03, min_sep_log10 = 0.06),
+    pass_label = "permissive"
+  )
+
+  all_peaks <- merge_peak_sets(strict_peaks, permissive_peaks)
+  dominant_peak <- if (nrow(strict_peaks) > 0) strict_peaks$peak_value[which.max(strict_peaks$area_fraction * strict_peaks$prominence)] else NA_real_
+
+  if (nrow(all_peaks) > 0 && is.finite(dominant_peak)) {
+    all_peaks$chicken_candidate <- all_peaks$peak_value < dominant_peak * 0.5 &
+      all_peaks$scatter_shift <= -0.4 &
+      all_peaks$area_fraction >= 0.05
+  } else {
+    all_peaks$chicken_candidate <- FALSE
+  }
+
+  sample_summary <- cbind(
+    data.frame(file_name = file_name, stringsAsFactors = FALSE),
+    qc_metrics,
+    data.frame(
+      peak_count_strict = nrow(strict_peaks),
+      peak_count_total = nrow(all_peaks),
+      dominant_peak = dominant_peak,
+      stringsAsFactors = FALSE
+    )
+  )
+
+  list(
+    raw = raw_df,
+    qc = qc_df,
+    peaks = all_peaks,
+    strict_peaks = strict_peaks,
+    summary = sample_summary
+  )
+}
+
+classify_chicken_reference <- function(sample_peak_tbl, sample_meta) {
+  candidate_tbl <- subset(
+    sample_peak_tbl,
+    chicken_candidate &
+      is.finite(peak_value) &
+      is.finite(scatter_shift)
+  )
+
+  control_candidates <- merge(
+    candidate_tbl,
+    subset(sample_meta, oxygen_condition == "C"),
+    by = "file_name"
+  )
+
+  if (nrow(control_candidates) >= 2) {
+    control_center <- median(log10(control_candidates$peak_value), na.rm = TRUE)
+    control_scale <- robust_scale(log10(control_candidates$peak_value))["scale"]
+  } else if (nrow(candidate_tbl) >= 2) {
+    control_center <- median(log10(candidate_tbl$peak_value), na.rm = TRUE)
+    control_scale <- robust_scale(log10(candidate_tbl$peak_value))["scale"]
+  } else {
+    control_center <- NA_real_
+    control_scale <- NA_real_
+  }
+
+  if (!is.finite(control_scale) || control_scale <= 0) {
+    control_scale <- 0.12
+  }
+
+  choose_one <- function(d) {
+    if (nrow(d) == 0) {
+      return(data.frame())
+    }
+
+    if (is.finite(control_center)) {
+      d$consensus_distance <- abs(log10(d$peak_value) - control_center)
+      d$consensus_score <- d$prominence * d$area_fraction / (1 + d$consensus_distance)
+      d <- d[order(d$consensus_distance, -d$consensus_score), , drop = FALSE]
+      chosen <- d[1, , drop = FALSE]
+      chosen$chicken_status <- if (chosen$consensus_distance <= max(0.18, 2 * control_scale)) "assigned" else "ambiguous"
+    } else {
+      d$consensus_distance <- NA_real_
+      d$consensus_score <- d$prominence * d$area_fraction
+      d <- d[order(-d$consensus_score), , drop = FALSE]
+      chosen <- d[1, , drop = FALSE]
+      chosen$chicken_status <- "tentative"
+    }
+
+    chosen
+  }
+
+  assigned_tbl <- do.call(
+    rbind,
+    lapply(split(candidate_tbl, candidate_tbl$file_name), choose_one)
+  )
+
+  list(
+    assigned = assigned_tbl,
+    consensus_log10_center = control_center,
+    consensus_log10_scale = control_scale
+  )
+}
+
+classify_major_structure <- function(sample_peak_tbl, chicken_tbl) {
+  out <- merge(sample_peak_tbl, chicken_tbl[, c("file_name", "peak_value", "chicken_status")], by = "file_name", all.x = TRUE, suffixes = c("", "_chicken"))
+  names(out)[names(out) == "peak_value_chicken"] <- "assigned_chicken_peak"
+
+  out$non_chicken_peak <- with(out, is.na(assigned_chicken_peak) | abs(log10(peak_value) - log10(assigned_chicken_peak)) >= 0.08)
+  out$major_population_candidate <- out$non_chicken_peak & out$pass == "strict"
+
+  major_tbl <- do.call(
+    rbind,
+    lapply(split(out, out$file_name), function(d) {
+      d <- subset(d, major_population_candidate)
+      if (nrow(d) == 0) {
+        return(data.frame())
+      }
+      d[which.max(d$area_fraction * d$prominence), , drop = FALSE]
+    })
+  )
+
+  major_tbl
 }
 ```
 
-```{r flow-import}
-flow_raw <- setNames(lapply(ff, read_flow_table), ff)
-flow_qc <- setNames(lapply(flow_raw, apply_qc_gate), ff)
+# Import, QC, and Peak Detection
 
-qc_overview <- do.call(
+```{r sample-analysis}
+sample_analysis <- setNames(lapply(ff, analyze_sample), ff)
+
+flow_raw <- lapply(sample_analysis, `[[`, "raw")
+flow_qc <- lapply(sample_analysis, `[[`, "qc")
+sample_summary <- do.call(rbind, lapply(sample_analysis, `[[`, "summary"))
+sample_peak_tbl <- do.call(
   rbind,
-  lapply(names(flow_raw), function(file_name) {
-    data.frame(
-      file_name = file_name,
-      events_raw = nrow(flow_raw[[file_name]]),
-      events_qc = nrow(flow_qc[[file_name]]),
-      qc_retention = nrow(flow_qc[[file_name]]) / nrow(flow_raw[[file_name]])
-    )
+  lapply(names(sample_analysis), function(file_name) {
+    peak_df <- sample_analysis[[file_name]]$peaks
+    if (nrow(peak_df) == 0) {
+      return(data.frame(
+        file_name = character(0),
+        peak_log10 = numeric(0),
+        peak_value = numeric(0),
+        density_height = numeric(0),
+        prominence = numeric(0),
+        left_value = numeric(0),
+        right_value = numeric(0),
+        area_fraction = numeric(0),
+        median_logFSC = numeric(0),
+        median_logSSC = numeric(0),
+        scatter_shift = numeric(0),
+        pass = character(0),
+        chicken_candidate = logical(0),
+        stringsAsFactors = FALSE
+      ))
+    }
+    peak_df$file_name <- file_name
+    peak_df
   })
 )
 
-kable(qc_overview, digits = 3, caption = "Event counts before and after a conservative exploratory QC gate.")
+chicken_result <- classify_chicken_reference(sample_peak_tbl, sample_meta)
+chicken_tbl <- chicken_result$assigned
+major_tbl <- classify_major_structure(sample_peak_tbl, chicken_tbl)
+
+analysis_tbl <- merge(sample_meta, sample_summary, by = "file_name", sort = FALSE, all.x = TRUE)
+analysis_tbl <- merge(
+  analysis_tbl,
+  chicken_tbl[, c("file_name", "peak_value", "prominence", "area_fraction", "scatter_shift", "pass", "chicken_status", "consensus_distance")],
+  by = "file_name",
+  all.x = TRUE
+)
+names(analysis_tbl)[names(analysis_tbl) == "peak_value"] <- "chicken_peak"
+names(analysis_tbl)[names(analysis_tbl) == "prominence"] <- "chicken_prominence"
+names(analysis_tbl)[names(analysis_tbl) == "area_fraction"] <- "chicken_area_fraction"
+names(analysis_tbl)[names(analysis_tbl) == "scatter_shift"] <- "chicken_scatter_shift"
+names(analysis_tbl)[names(analysis_tbl) == "pass"] <- "chicken_detection_pass"
+
+analysis_tbl <- merge(
+  analysis_tbl,
+  major_tbl[, c("file_name", "peak_value", "prominence", "area_fraction", "scatter_shift")],
+  by = "file_name",
+  all.x = TRUE
+)
+names(analysis_tbl)[names(analysis_tbl) == "peak_value"] <- "major_peak"
+names(analysis_tbl)[names(analysis_tbl) == "prominence"] <- "major_peak_prominence"
+names(analysis_tbl)[names(analysis_tbl) == "area_fraction"] <- "major_peak_area_fraction"
+names(analysis_tbl)[names(analysis_tbl) == "scatter_shift"] <- "major_peak_scatter_shift"
+
+analysis_tbl$major_to_chicken_ratio <- analysis_tbl$major_peak / analysis_tbl$chicken_peak
+analysis_tbl$qc_flag_low_events <- analysis_tbl$events_after_time < 2000
+analysis_tbl$qc_flag_low_retention <- with(analysis_tbl, retention_basic * retention_singlets * retention_time < 0.35)
+analysis_tbl$qc_flag_no_chicken <- !is.finite(analysis_tbl$chicken_peak)
+analysis_tbl$qc_flag_chicken_ambiguous <- is.na(analysis_tbl$chicken_status) | analysis_tbl$chicken_status != "assigned"
+analysis_tbl$qc_flag_no_major_peak <- !is.finite(analysis_tbl$major_peak)
+analysis_tbl$qc_flag_structure_unresolved <- analysis_tbl$qc_flag_no_major_peak | analysis_tbl$qc_flag_no_chicken
+
+analysis_tbl <- analysis_tbl[
+  order(analysis_tbl$starting_ploidy, analysis_tbl$oxygen_condition, analysis_tbl$replicate_id),
+]
+
+kable(
+  analysis_tbl[, c(
+    "sample_id", "starting_ploidy", "oxygen_condition",
+    "events_raw", "events_after_time", "peak_count_total",
+    "chicken_peak", "chicken_status", "major_peak",
+    "major_to_chicken_ratio", "qc_flag_low_events",
+    "qc_flag_low_retention", "qc_flag_structure_unresolved"
+  )],
+  digits = 3,
+  caption = "Per-sample QC and peak summary after conservative filtering, two-stage peak detection, and explicit chicken-reference classification."
+)
 ```
 
-# Quality-Control Visualizations
+# Assay and QC Summary
+
+```{r qc-overview-table}
+qc_overview <- analysis_tbl[, c(
+  "sample_id", "starting_ploidy", "oxygen_condition",
+  "events_raw", "events_after_basic", "events_after_singlets", "events_after_time",
+  "retention_basic", "retention_singlets", "retention_time",
+  "qc_flag_low_events", "qc_flag_low_retention"
+)]
+
+kable(
+  qc_overview,
+  digits = 3,
+  caption = "QC retention across the staged filtering workflow. The intent is to remove clear acquisition artifacts while preserving potentially real biological structure."
+)
+```
 
 ```{r qc-example-plot}
-example_file <- sample_meta$file_name[1]
+example_file <- analysis_tbl$file_name[1]
 example_raw <- flow_raw[[example_file]]
 example_qc <- flow_qc[[example_file]]
 
 ggplot(example_raw, aes(x = FSC.A, y = SSC.A)) +
-  geom_point(alpha = 0.08, size = 0.3, color = "#9c6644") +
+  geom_point(alpha = 0.05, size = 0.25, color = "#9c6644") +
   geom_point(
     data = example_qc,
     aes(x = FSC.A, y = SSC.A),
-    alpha = 0.08,
-    size = 0.3,
+    alpha = 0.05,
+    size = 0.25,
     color = "#386641"
   ) +
   labs(
     title = paste("QC overlay for", example_file),
-    subtitle = "Raw events in brown, retained events in green",
+    subtitle = "Raw events in brown, retained events in green; the workflow avoids a narrow tumor-centered scatter gate",
     x = "FSC-A",
     y = "SSC-A"
   ) +
   theme_minimal(base_size = 12)
 ```
 
-# Peak Detection on DNA Channel
-
-```{r peak-summary}
-peak_summary <- do.call(
+```{r qc-time-summary}
+time_qc_tbl <- do.call(
   rbind,
-  lapply(ff, summarize_sample)
+  lapply(names(flow_qc), function(file_name) {
+    df <- flow_qc[[file_name]]
+    data.frame(
+      file_name = file_name,
+      sample_id = sample_meta$sample_id[sample_meta$file_name == file_name],
+      median_dna = median(df[[dna_channel]], na.rm = TRUE),
+      iqr_dna = IQR(df[[dna_channel]], na.rm = TRUE),
+      median_fsc = median(df$FSC.A, na.rm = TRUE),
+      median_ssc = median(df$SSC.A, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+  })
 )
 
-analysis_tbl <- merge(sample_meta, peak_summary, by = "file_name", sort = FALSE)
-analysis_tbl <- analysis_tbl[order(analysis_tbl$starting_ploidy, analysis_tbl$oxygen_condition, analysis_tbl$replicate_id), ]
-
 kable(
-  analysis_tbl,
-  digits = 3,
-  caption = "Per-sample DNA peak summary after QC filtering and heuristic density-peak calling."
+  time_qc_tbl,
+  digits = 2,
+  caption = "Assay-level summaries after QC. Between-sample shifts here are descriptive and should not automatically be interpreted biologically."
 )
 ```
 
-```{r example-density}
-example_peaks <- find_density_peaks(example_qc[[dna_channel]], n = 4)
+# Chicken Reference Assessment
 
-ggplot(example_qc, aes(x = .data[[dna_channel]])) +
-  geom_density(fill = "#8ecae6", alpha = 0.5, color = "#023047", linewidth = 0.8) +
-  geom_vline(
-    data = example_peaks,
-    aes(xintercept = x),
-    color = "#d00000",
-    linetype = "dashed",
-    linewidth = 0.7
+The chicken-reference strategy is intentionally stricter than the previous
+workflow. A candidate chicken peak must satisfy all of the following:
+
+1. It is materially lower in DNA intensity than the dominant sample peak.
+2. It sits in a smaller-scatter compartment than the sample median, consistent
+   with a distinct internal reference population.
+3. It carries enough mass to represent a real subpopulation rather than a small
+   shoulder or noise feature.
+4. It is reasonably consistent with the control-sample chicken consensus on the
+   log scale.
+
+If those conditions are not met, the workflow leaves the chicken assignment
+ambiguous instead of forcing a label.
+
+```{r chicken-consensus-text, results='asis'}
+if (is.finite(chicken_result$consensus_log10_center)) {
+  cat(
+    sprintf(
+      paste(
+        "The control-anchored chicken-reference consensus is centered at approximately %.0f DNA-channel units",
+        "(log10 center %.3f, robust scale %.3f).",
+        "Distances from this consensus are used as one component of per-sample chicken assignment."
+      ),
+      10^chicken_result$consensus_log10_center,
+      chicken_result$consensus_log10_center,
+      chicken_result$consensus_log10_scale
+    )
+  )
+} else {
+  cat("A stable control-based chicken-reference consensus could not be estimated from the current data.")
+}
+```
+
+```{r chicken-reference-plot}
+chicken_plot_tbl <- merge(
+  sample_peak_tbl,
+  sample_meta[, c("file_name", "sample_id", "starting_ploidy", "oxygen_condition")],
+  by = "file_name"
+)
+
+chicken_plot_tbl$peak_role <- "Other peak"
+chicken_plot_tbl$peak_role[chicken_plot_tbl$chicken_candidate] <- "Chicken candidate"
+
+if (nrow(chicken_tbl) > 0) {
+  chosen_keys <- paste(chicken_tbl$file_name, signif(chicken_tbl$peak_value, 8))
+  plot_keys <- paste(chicken_plot_tbl$file_name, signif(chicken_plot_tbl$peak_value, 8))
+  chicken_plot_tbl$peak_role[plot_keys %in% chosen_keys] <- "Assigned chicken"
+}
+
+ggplot(
+  chicken_plot_tbl,
+  aes(x = peak_value, y = scatter_shift, color = peak_role, shape = oxygen_condition)
+) +
+  geom_hline(yintercept = -0.4, linetype = "dotted", color = "grey45") +
+  geom_point(aes(size = area_fraction), alpha = 0.85) +
+  scale_x_log10(labels = label_number()) +
+  scale_color_manual(
+    values = c(
+      "Other peak" = "#6c757d",
+      "Chicken candidate" = "#e9c46a",
+      "Assigned chicken" = "#d62828"
+    )
   ) +
   labs(
-    title = paste("DNA density with called peaks for", example_file),
-    subtitle = "Dashed lines mark the strongest local maxima",
+    title = "Chicken-reference candidates across samples",
+    subtitle = "The assigned chicken peak must be both low-DNA and low-scatter relative to the sample, then checked against the control consensus",
+    x = "Peak position on DNA channel",
+    y = "Scatter shift relative to sample median FSC",
+    color = "Peak class",
+    shape = "Oxygen condition",
+    size = "Peak mass"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r chicken-summary-table}
+chicken_summary_tbl <- analysis_tbl[, c(
+  "sample_id", "starting_ploidy", "oxygen_condition",
+  "chicken_peak", "chicken_status", "chicken_detection_pass",
+  "chicken_area_fraction", "chicken_prominence",
+  "chicken_scatter_shift", "consensus_distance"
+)]
+
+kable(
+  chicken_summary_tbl,
+  digits = 3,
+  caption = "Chicken-reference assignments. Samples marked ambiguous or unresolved are intentionally not forced into a reference interpretation."
+)
+```
+
+# Recoverable Population Structure
+
+The strict peak call represents structure that is reasonably well supported by
+the DNA density after QC. The permissive pass is used primarily to avoid missing
+the chicken reference. Interpretation of the major non-chicken peak remains
+descriptive unless the sample also has a credible chicken assignment.
+
+```{r example-density}
+example_peaks <- subset(sample_peak_tbl, file_name == example_file)
+
+ggplot(example_qc, aes(x = .data[[dna_channel]])) +
+  geom_density(fill = "#8ecae6", alpha = 0.5, color = "#023047", linewidth = 0.8, adjust = 1.4) +
+  geom_vline(
+    data = example_peaks,
+    aes(xintercept = peak_value, color = pass),
+    linewidth = 0.7,
+    linetype = "dashed"
+  ) +
+  scale_color_manual(values = c("strict" = "#d00000", "permissive" = "#6a4c93")) +
+  labs(
+    title = paste("DNA density and called peaks for", example_file),
+    subtitle = "Strict peaks summarize robust structure; permissive peaks are retained mainly to rescue low-DNA reference structure",
     x = "450-Violet C-A",
-    y = "Density"
+    y = "Density",
+    color = "Peak pass"
   ) +
   theme_minimal(base_size = 12)
 ```
@@ -242,50 +757,36 @@ ggplot(example_qc, aes(x = .data[[dna_channel]])) +
 ```{r all-sample-density-grid, fig.height=14, fig.width=16}
 sample_order <- analysis_tbl$file_name
 
-density_list <- lapply(sample_order, function(file_name) {
-  dens <- density(flow_qc[[file_name]][[dna_channel]], n = 2048, adjust = 1.2)
-  data.frame(
-    file_name = file_name,
-    dna_value = dens$x,
-    density_value = dens$y
-  )
-})
+density_tbl <- do.call(
+  rbind,
+  lapply(sample_order, function(file_name) {
+    dens <- density(log10(flow_qc[[file_name]][[dna_channel]]), n = 2048, adjust = 1.4)
+    data.frame(
+      file_name = file_name,
+      dna_value = 10^dens$x,
+      density_value = dens$y,
+      stringsAsFactors = FALSE
+    )
+  })
+)
 
-peak_list <- lapply(sample_order, function(file_name) {
-  peaks <- find_density_peaks(flow_qc[[file_name]][[dna_channel]], n = 4)
-  if (nrow(peaks) == 0) {
-    return(data.frame(
-      file_name = character(0),
-      peak_position = numeric(0),
-      peak_height = numeric(0)
-    ))
-  }
-
-  data.frame(
-    file_name = file_name,
-    peak_position = peaks$x,
-    peak_height = peaks$y
-  )
-})
-
-sample_density_tbl <- do.call(rbind, density_list)
-sample_peak_tbl <- do.call(rbind, peak_list)
-
-sample_density_tbl$file_name <- factor(sample_density_tbl$file_name, levels = sample_order)
-sample_peak_tbl$file_name <- factor(sample_peak_tbl$file_name, levels = sample_order)
+peak_grid_tbl <- sample_peak_tbl
+peak_grid_tbl$file_name <- factor(peak_grid_tbl$file_name, levels = sample_order)
+density_tbl$file_name <- factor(density_tbl$file_name, levels = sample_order)
 
 facet_labels <- setNames(analysis_tbl$sample_id, analysis_tbl$file_name)
 
-ggplot(sample_density_tbl, aes(x = dna_value, y = density_value)) +
+ggplot(density_tbl, aes(x = dna_value, y = density_value)) +
   geom_area(fill = "#8ecae6", alpha = 0.5) +
   geom_line(color = "#023047", linewidth = 0.5) +
   geom_vline(
-    data = sample_peak_tbl,
-    aes(xintercept = peak_position),
-    color = "#d00000",
+    data = peak_grid_tbl,
+    aes(xintercept = peak_value, color = pass),
     linetype = "dashed",
     linewidth = 0.4
   ) +
+  scale_x_log10(labels = label_number()) +
+  scale_color_manual(values = c("strict" = "#d00000", "permissive" = "#6a4c93")) +
   facet_wrap(
     ~file_name,
     ncol = 4,
@@ -294,10 +795,11 @@ ggplot(sample_density_tbl, aes(x = dna_value, y = density_value)) +
     labeller = as_labeller(facet_labels)
   ) +
   labs(
-    title = "DNA intensity with called peaks for every flow sample",
-    subtitle = "Each panel shows the QC-filtered DNA density; dashed lines mark called local maxima",
+    title = "QC-filtered DNA density for every flow sample",
+    subtitle = "The plot shows recoverable density structure rather than forcing a fixed two-peak interpretation",
     x = "450-Violet C-A",
-    y = "Density"
+    y = "Density",
+    color = "Peak pass"
   ) +
   theme_minimal(base_size = 10) +
   theme(
@@ -306,100 +808,161 @@ ggplot(sample_density_tbl, aes(x = dna_value, y = density_value)) +
   )
 ```
 
-# Summary Plots
+```{r structure-summary-plot}
+plot_tbl <- rbind(
+  data.frame(
+    sample_id = analysis_tbl$sample_id,
+    starting_ploidy = analysis_tbl$starting_ploidy,
+    oxygen_condition = analysis_tbl$oxygen_condition,
+    peak_type = "Assigned chicken",
+    peak_value = analysis_tbl$chicken_peak,
+    status = analysis_tbl$chicken_status,
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    sample_id = analysis_tbl$sample_id,
+    starting_ploidy = analysis_tbl$starting_ploidy,
+    oxygen_condition = analysis_tbl$oxygen_condition,
+    peak_type = "Major non-chicken peak",
+    peak_value = analysis_tbl$major_peak,
+    status = ifelse(is.finite(analysis_tbl$major_peak), "detected", "unresolved"),
+    stringsAsFactors = FALSE
+  )
+)
 
-```{r summary-plots}
-ggplot(
-  analysis_tbl,
-  aes(x = oxygen_condition, y = tumor_to_chicken_ratio, color = starting_ploidy)
-) +
-  geom_point(position = position_jitter(width = 0.08, height = 0), size = 2.4, alpha = 0.9) +
-  stat_summary(aes(group = starting_ploidy), fun = mean, geom = "line", linewidth = 0.8) +
+ggplot(plot_tbl, aes(x = oxygen_condition, y = peak_value, fill = peak_type)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_point(
+    aes(shape = status),
+    position = position_jitterdodge(jitter.width = 0.08, dodge.width = 0.75),
+    size = 1.8,
+    alpha = 0.9
+  ) +
+  scale_y_log10(labels = label_number()) +
+  scale_fill_manual(values = c("Assigned chicken" = "#f4a261", "Major non-chicken peak" = "#2a9d8f")) +
   facet_wrap(~starting_ploidy, nrow = 1) +
-  scale_color_manual(values = c("2N" = "#1d3557", "4N" = "#d62828")) +
-  scale_y_continuous(labels = number_format(accuracy = 0.01)) +
   labs(
-    title = "Normalized tumor DNA content across oxygen conditions",
+    title = "Recovered peak positions by control lineage and oxygen condition",
+    subtitle = "These are descriptive assay summaries, not yet a downstream biological model",
     x = "Oxygen condition",
-    y = "Tumor G0/G1 peak divided by chicken reference peak",
+    y = "Peak position on DNA channel",
+    fill = "Peak type",
+    shape = "Status"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+# Technical Variability and Control Sanity Checks
+
+```{r technical-variability-table}
+control_tbl <- subset(analysis_tbl, oxygen_condition == "C")
+
+technical_variability_tbl <- data.frame(
+  metric = c(
+    "Chicken peak CV among C samples",
+    "Major peak CV among C samples",
+    "2N control ratio median",
+    "4N control ratio median"
+  ),
+  value = c(
+    sd(control_tbl$chicken_peak, na.rm = TRUE) / mean(control_tbl$chicken_peak, na.rm = TRUE),
+    sd(control_tbl$major_peak, na.rm = TRUE) / mean(control_tbl$major_peak, na.rm = TRUE),
+    median(subset(control_tbl, starting_ploidy == "2N")$major_to_chicken_ratio, na.rm = TRUE),
+    median(subset(control_tbl, starting_ploidy == "4N")$major_to_chicken_ratio, na.rm = TRUE)
+  ),
+  stringsAsFactors = FALSE
+)
+
+kable(
+  technical_variability_tbl,
+  digits = 3,
+  caption = "Simple technical summaries from the control condition. These values are intended as assay diagnostics, not final calibration constants."
+)
+```
+
+```{r control-sanity-plot}
+control_plot_tbl <- subset(analysis_tbl, oxygen_condition == "C" & is.finite(major_to_chicken_ratio))
+
+ggplot(control_plot_tbl, aes(x = starting_ploidy, y = major_to_chicken_ratio, color = starting_ploidy)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.2) +
+  geom_point(position = position_jitter(width = 0.06, height = 0), size = 2.5) +
+  scale_color_manual(values = c("2N" = "#1d3557", "4N" = "#d62828")) +
+  labs(
+    title = "Control-lineage sanity check",
+    subtitle = "The 2N and 4N lineages should show distinguishable normalized structure if the reference and major peak assignments are credible",
+    x = "Starting ploidy lineage",
+    y = "Major peak / chicken peak",
     color = "Starting ploidy"
   ) +
   theme_minimal(base_size = 12) +
   theme(legend.position = "none")
 ```
 
-```{r summary-plot-peaks}
-plot_tbl <- rbind(
-  data.frame(
-    sample_id = analysis_tbl$sample_id,
-    starting_ploidy = analysis_tbl$starting_ploidy,
-    oxygen_condition = analysis_tbl$oxygen_condition,
-    peak_type = "Chicken reference",
-    peak_value = analysis_tbl$chicken_peak
-  ),
-  data.frame(
-    sample_id = analysis_tbl$sample_id,
-    starting_ploidy = analysis_tbl$starting_ploidy,
-    oxygen_condition = analysis_tbl$oxygen_condition,
-    peak_type = "Tumor G0/G1",
-    peak_value = analysis_tbl$tumor_g1_peak
-  )
-)
+# Ambiguity and Failure Modes
 
-ggplot(plot_tbl, aes(x = oxygen_condition, y = peak_value, fill = peak_type)) +
-  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
-  geom_point(position = position_jitterdodge(jitter.width = 0.08, dodge.width = 0.75), size = 1.8, alpha = 0.9) +
-  facet_wrap(~starting_ploidy, nrow = 1) +
-  scale_fill_manual(values = c("Chicken reference" = "#f4a261", "Tumor G0/G1" = "#2a9d8f")) +
-  labs(
-    title = "Peak positions by oxygen condition",
-    x = "Oxygen condition",
-    y = "Peak position on DNA channel",
-    fill = "Peak type"
-  ) +
-  theme_minimal(base_size = 12)
-```
+This workflow does not assume every sample contains a clean chicken peak plus a
+single tumor G0/G1 peak. The main ambiguity modes observed here are:
 
-# Initial Model
+1. The low-DNA compartment can be present but weak, broad, or poorly separated
+   from debris or acquisition artifacts.
+2. Some samples show strong high-DNA structure without an equally convincing
+   chicken assignment.
+3. In O1 and O2 samples, the major non-chicken peak may shift or split in ways
+   that should not be normalized away without a defensible reference call.
 
-```{r initial-model}
-model_tbl <- subset(
+```{r ambiguity-table}
+ambiguity_tbl <- subset(
   analysis_tbl,
-  is.finite(tumor_to_chicken_ratio) & !qc_flag_missing_peaks
-)
-
-initial_model <- lm(
-  tumor_to_chicken_ratio ~ starting_ploidy * oxygen_condition,
-  data = model_tbl
-)
-
-model_coef <- data.frame(
-  term = names(coef(initial_model)),
-  estimate = unname(coef(initial_model)),
-  stringsAsFactors = FALSE
-)
+  qc_flag_low_events |
+    qc_flag_low_retention |
+    qc_flag_no_chicken |
+    qc_flag_chicken_ambiguous |
+    qc_flag_no_major_peak
+)[, c(
+  "sample_id", "starting_ploidy", "oxygen_condition",
+  "qc_flag_low_events", "qc_flag_low_retention",
+  "qc_flag_no_chicken", "qc_flag_chicken_ambiguous",
+  "qc_flag_no_major_peak"
+)]
 
 kable(
-  model_coef,
-  digits = 4,
-  caption = "Coefficient table from an exploratory linear model of normalized tumor DNA content."
+  ambiguity_tbl,
+  caption = "Samples carrying at least one unresolved or ambiguous QC/interpretation flag."
 )
 ```
 
-```{r model-summary-text, results='asis'}
+# Interpretation at This Stage
+
+```{r interpretation-text, results='asis'}
+assigned_chicken_n <- sum(analysis_tbl$chicken_status == "assigned", na.rm = TRUE)
+ambiguous_chicken_n <- sum(analysis_tbl$qc_flag_chicken_ambiguous, na.rm = TRUE)
+resolved_major_n <- sum(is.finite(analysis_tbl$major_peak), na.rm = TRUE)
+
 cat(
   sprintf(
     paste(
-      "The exploratory model was fit on %s samples with usable peak calls.",
-      "This should be treated as a workflow check rather than a final biological conclusion."
+      "Across %s samples, the workflow assigns a chicken reference in %s samples,",
+      "marks %s samples as ambiguous or unresolved for the chicken reference,",
+      "and recovers a major non-chicken peak in %s samples.",
+      "This document should therefore be read as a characterization of assay behavior and recoverable structure,",
+      "not as a final estimate of biological ploidy shifts."
     ),
-    nrow(model_tbl)
+    nrow(analysis_tbl),
+    assigned_chicken_n,
+    ambiguous_chicken_n,
+    resolved_major_n
   )
 )
 ```
 
 # Next Steps
 
-1. Replace the heuristic QC gate with explicit debris and singlet gates derived from the instrument channels and known control populations.
-2. Validate the peak annotations against manual inspection for a subset of samples before using the ratios in downstream inference.
-3. Extend the model to work on full distributions rather than just the dominant G0/G1 peak, especially if S-phase and 4N fractions become biologically important.
+1. Manually inspect the samples flagged as ambiguous to determine whether the
+   low-DNA compartment is true chicken, debris-adjacent material, or an
+   acquisition artifact.
+2. If a verified chicken gate can be defined from scatter plus fluorescence
+   jointly, incorporate that gate explicitly rather than relying on DNA density
+   alone.
+3. Once the reference assignment is stable, move to lineage-aware comparisons of
+   normalized structure and only then consider oxygen-associated biological
+   shifts.
