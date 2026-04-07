@@ -20,9 +20,10 @@ knitr::opts_chunk$set(
 
 # Goal
 
-This document runs the gating workflow across every FCS file found under
-`data/`. The expensive `gs` object is cached under `processed_data/` and reused
-on later renders when it already exists.
+This document runs the gating workflow independently for each dataset directory
+under `data/`. Each dataset gets its own cache under `processed_data/` and its
+own figure namespace under `figure/`, so additional datasets can be added
+without colliding with existing outputs.
 
 ```{r load-js, results='asis'}
 cat('<script src="https://unpkg.com/panzoom@9.4.0/dist/panzoom.min.js"></script>')
@@ -42,48 +43,132 @@ library(patchwork)
 ```
 
 ```{r config}
-path_to_fcs <- "data"
-processed_dir <- "processed_data"
-gs_cache_path <- file.path(processed_dir, "gating_gs")
-figure_dir <- "figure"
+data_root <- "data"
+processed_root <- "processed_data"
+figure_root <- "figure"
+
 reuse_existing_figures <- TRUE
 force_rebuild_figures <- FALSE
-plot_paths <- list(
-  fsc_ssc = file.path(figure_dir, "fsc-ssc-plots-1.png"),
-  dna_scatter = file.path(figure_dir, "dna-scatter-plots-1.png"),
-  dna_density = file.path(figure_dir, "dna-density-plots-1.png")
-)
 
-dir.create(processed_dir, recursive = TRUE, showWarnings = FALSE)
-dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
-stopifnot(dir.exists(path_to_fcs))
-
-flow_files <- list.files(
-  path_to_fcs,
-  pattern = "\\.fcs$",
-  full.names = TRUE,
-  recursive = TRUE
-)
-flow_files <- sort(normalizePath(flow_files, winslash = "/", mustWork = TRUE))
-
-stopifnot(length(flow_files) > 0)
-
-chs <- c(
+default_qc_channels <- c(
   "FSC-A", "FSC-H", "FSC-W",
   "SSC-A", "SSC-H", "SSC-W",
   "450-Violet C-A", "450-Violet C-H"
 )
-dna_ch <- c("450-Violet C-A", "450-Violet C-H")
-dna_cofactor <- 500
+default_dna_channels <- c("450-Violet C-A", "450-Violet C-H")
+default_dna_cofactor <- 500
+
+sanitize_dataset_id <- function(x) {
+  x <- tolower(gsub("[^A-Za-z0-9]+", "-", x))
+  x <- gsub("(^-+|-+$)", "", x)
+  if (!nzchar(x)) {
+    stop("Could not derive a dataset id from the supplied name.")
+  }
+  x
+}
+
+discover_dataset_dirs <- function(root_path) {
+  dirs <- list.dirs(root_path, recursive = FALSE, full.names = TRUE)
+  dirs <- dirs[!startsWith(basename(dirs), ".")]
+  dirs <- dirs[basename(dirs) != "cache"]
+  sort(normalizePath(dirs, winslash = "/", mustWork = TRUE))
+}
+
+discover_flow_files <- function(dataset_dir) {
+  files <- list.files(
+    dataset_dir,
+    pattern = "\\.fcs$",
+    full.names = TRUE,
+    recursive = TRUE,
+    ignore.case = TRUE
+  )
+  files <- files[!grepl("(^|[\\\\/])__MACOSX([\\\\/]|$)", files)]
+  files <- files[!startsWith(basename(files), "._")]
+  sort(normalizePath(files, winslash = "/", mustWork = TRUE))
+}
+
+make_plot_paths <- function(figure_dir) {
+  list(
+    fsc_ssc = file.path(figure_dir, "fsc-ssc-plots-1.png"),
+    dna_scatter = file.path(figure_dir, "dna-scatter-plots-1.png"),
+    dna_density = file.path(figure_dir, "dna-density-plots-1.png")
+  )
+}
+
+dir.create(processed_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(figure_root, recursive = TRUE, showWarnings = FALSE)
+stopifnot(dir.exists(data_root))
+
+dataset_dirs <- discover_dataset_dirs(data_root)
+stopifnot(length(dataset_dirs) > 0)
+
+dataset_tbl <- tibble(
+  dataset_name = basename(dataset_dirs),
+  dataset_dir = dataset_dirs,
+  dataset_id = vapply(basename(dataset_dirs), sanitize_dataset_id, character(1)),
+  enabled = TRUE
+)
+
+dataset_tbl$qc_channels <- rep(list(default_qc_channels), nrow(dataset_tbl))
+dataset_tbl$dna_channels <- rep(list(default_dna_channels), nrow(dataset_tbl))
+dataset_tbl$dna_cofactor <- rep(default_dna_cofactor, nrow(dataset_tbl))
+
+dataset_tbl <- dataset_tbl %>%
+  filter(enabled) %>%
+  mutate(
+    cache_dir = file.path(processed_root, dataset_id),
+    gs_cache_path = file.path(cache_dir, "gating_gs"),
+    figure_dir = file.path(figure_root, dataset_id)
+  )
+
+dataset_tbl$flow_files <- lapply(dataset_tbl$dataset_dir, discover_flow_files)
+dataset_tbl$n_files <- lengths(dataset_tbl$flow_files)
+stopifnot(all(dataset_tbl$n_files > 0))
+
+dataset_tbl$plot_paths <- lapply(dataset_tbl$figure_dir, make_plot_paths)
+dataset_tbl$has_cache <- dir.exists(dataset_tbl$gs_cache_path)
+dataset_tbl$has_all_reusable_plots <- vapply(
+  dataset_tbl$plot_paths,
+  function(x) all(file.exists(unlist(x))),
+  logical(1)
+)
+
+dataset_configs <- lapply(seq_len(nrow(dataset_tbl)), function(i) {
+  list(
+    dataset_name = dataset_tbl$dataset_name[[i]],
+    dataset_dir = dataset_tbl$dataset_dir[[i]],
+    dataset_id = dataset_tbl$dataset_id[[i]],
+    qc_channels = dataset_tbl$qc_channels[[i]],
+    dna_channels = dataset_tbl$dna_channels[[i]],
+    dna_cofactor = dataset_tbl$dna_cofactor[[i]],
+    cache_dir = dataset_tbl$cache_dir[[i]],
+    gs_cache_path = dataset_tbl$gs_cache_path[[i]],
+    figure_dir = dataset_tbl$figure_dir[[i]],
+    flow_files = dataset_tbl$flow_files[[i]],
+    plot_paths = dataset_tbl$plot_paths[[i]],
+    has_cache = dataset_tbl$has_cache[[i]],
+    has_all_reusable_plots = dataset_tbl$has_all_reusable_plots[[i]]
+  )
+})
+names(dataset_configs) <- vapply(dataset_configs, `[[`, character(1), "dataset_id")
 ```
 
-# Inputs
+# Dataset Inventory
 
-```{r inputs}
-input_tbl <- tibble(
-  sample_name = basename(flow_files),
-  source_path = flow_files
-)
+```{r dataset-inventory}
+dataset_inventory <- dataset_tbl %>%
+  transmute(
+    dataset_name,
+    dataset_id,
+    dataset_dir,
+    n_files,
+    has_cache,
+    has_all_reusable_plots
+  )
+
+if (nrow(dataset_inventory) <= 12 && ncol(dataset_inventory) <= 6) {
+  kable(dataset_inventory)
+}
 ```
 
 # Helper Functions
@@ -96,6 +181,57 @@ first_flowFrame <- function(x) {
     if (length(hits) > 0) return(x[[hits[1]]])
   }
   stop("Could not find a flowFrame in RemoveMargins output.")
+}
+
+validate_dna_channels <- function(dna_channels, dataset_name) {
+  if (length(dna_channels) != 2) {
+    stop(sprintf(
+      "Dataset '%s' must define exactly two DNA channels; got %d.",
+      dataset_name,
+      length(dna_channels)
+    ))
+  }
+}
+
+validate_flowset_channels <- function(fs, required_channels, dataset_name) {
+  missing_by_sample <- lapply(sampleNames(fs), function(sn) {
+    setdiff(required_channels, colnames(fs[[sn]]))
+  })
+  names(missing_by_sample) <- sampleNames(fs)
+
+  bad_samples <- names(missing_by_sample)[lengths(missing_by_sample) > 0]
+  if (length(bad_samples) > 0) {
+    detail <- paste(
+      sprintf(
+        "%s [%s]",
+        bad_samples,
+        vapply(
+          missing_by_sample[bad_samples],
+          function(x) paste(x, collapse = ", "),
+          character(1)
+        )
+      ),
+      collapse = "; "
+    )
+    stop(sprintf(
+      "Dataset '%s' is missing required channels in one or more samples: %s",
+      dataset_name,
+      detail
+    ))
+  }
+}
+
+validate_cached_gs <- function(gs, flow_files, dataset_name) {
+  expected_samples <- sort(basename(flow_files))
+  cached_samples <- sort(basename(sampleNames(gs)))
+
+  if (!identical(expected_samples, cached_samples)) {
+    stop(sprintf(
+      "Cached GatingSet for dataset '%s' does not match the current files on disk. Remove '%s' and rerender.",
+      dataset_name,
+      file.path(processed_root, sanitize_dataset_id(dataset_name), "gating_gs")
+    ))
+  }
 }
 
 dna_singlet_vec <- function(ff, a = "450-Violet C-A", h = "450-Violet C-H", nmads = 4) {
@@ -180,12 +316,15 @@ process_masks <- function(ff_raw, qc_channels, dna_channels, IT_limit = 0.65, dn
   )
 }
 
-build_gs <- function(flow_files, qc_channels, dna_channels, dna_cofactor = 500) {
+build_gs <- function(flow_files, qc_channels, dna_channels, dataset_name, dna_cofactor = 500) {
+  validate_dna_channels(dna_channels, dataset_name)
+
   fs <- read.flowSet(
     files = flow_files,
     transformation = FALSE,
     truncate_max_range = FALSE
   )
+  validate_flowset_channels(fs, unique(c(qc_channels, dna_channels)), dataset_name)
 
   mask_list <- lapply(sampleNames(fs), function(sn) {
     process_masks(fs[[sn]], qc_channels = qc_channels, dna_channels = dna_channels, dna_cofactor = dna_cofactor)
@@ -227,7 +366,117 @@ build_gs <- function(flow_files, qc_channels, dna_channels, dna_cofactor = 500) 
   gs
 }
 
-render_or_include_plot <- function(plot_path, plot_builder, width, height, dpi = 300) {
+build_or_load_dataset <- function(cfg) {
+  dir.create(cfg$cache_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(cfg$figure_dir, recursive = TRUE, showWarnings = FALSE)
+
+  gs <- if (dir.exists(cfg$gs_cache_path)) {
+    cached_gs <- load_gs(cfg$gs_cache_path)
+    validate_cached_gs(cached_gs, cfg$flow_files, cfg$dataset_name)
+    cached_gs
+  } else {
+    built_gs <- build_gs(
+      flow_files = cfg$flow_files,
+      qc_channels = cfg$qc_channels,
+      dna_channels = cfg$dna_channels,
+      dataset_name = cfg$dataset_name,
+      dna_cofactor = cfg$dna_cofactor
+    )
+    save_gs(built_gs, path = cfg$gs_cache_path, backend_opt = "copy")
+    built_gs
+  }
+
+  input_tbl <- tibble(
+    dataset_id = cfg$dataset_id,
+    dataset_name = cfg$dataset_name,
+    sample_name = basename(cfg$flow_files),
+    source_path = cfg$flow_files
+  )
+
+  gate_counts <- as_tibble(gs_pop_get_count_fast(gs)) %>%
+    mutate(
+      dataset_id = cfg$dataset_id,
+      dataset_name = cfg$dataset_name,
+      .before = 1
+    )
+
+  peak_table <- lapply(sampleNames(gs), function(sn) {
+    ff <- gh_pop_get_data(gs[[sn]], "Singlets")
+    pk <- find_density_peaks(exprs(ff)[, cfg$dna_channels[1]])
+    pk <- pk[order(pk$x), , drop = FALSE]
+
+    tibble(
+      dataset_id = cfg$dataset_id,
+      dataset_name = cfg$dataset_name,
+      sample = sn,
+      peak_x = pk$x,
+      peak_density = pk$y
+    )
+  })
+  peak_table <- bind_rows(peak_table)
+
+  list(
+    config = cfg,
+    gs = gs,
+    input_tbl = input_tbl,
+    gate_counts = gate_counts,
+    peak_table = peak_table
+  )
+}
+
+should_print_table <- function(tbl, max_rows = 12, max_cols = 6) {
+  nrow(tbl) <= max_rows && ncol(tbl) <= max_cols
+}
+
+dataset_input_summary <- function(input_tbl) {
+  tibble(
+    dataset_id = dplyr::first(input_tbl$dataset_id),
+    dataset_name = dplyr::first(input_tbl$dataset_name),
+    n_files = nrow(input_tbl),
+    first_sample = dplyr::first(input_tbl$sample_name),
+    last_sample = dplyr::last(input_tbl$sample_name)
+  )
+}
+
+dataset_gate_summary <- function(gate_counts) {
+  value_col <- intersect(c("count", "Count"), names(gate_counts))[1]
+  pop_col <- intersect(c("pop", "Population", "population", "name"), names(gate_counts))[1]
+
+  if (is.na(value_col) || is.na(pop_col)) {
+    return(tibble(note = "Gate count schema not recognized for compact summary."))
+  }
+
+  gate_counts %>%
+    group_by(.data[[pop_col]]) %>%
+    summarise(
+      n_samples = dplyr::n(),
+      min_count = min(.data[[value_col]], na.rm = TRUE),
+      median_count = median(.data[[value_col]], na.rm = TRUE),
+      max_count = max(.data[[value_col]], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    rename(population = 1)
+}
+
+dataset_peak_summary <- function(peak_table) {
+  if (nrow(peak_table) == 0) {
+    return(tibble(note = "No peaks detected."))
+  }
+
+  peak_counts <- peak_table %>%
+    count(sample, name = "n_peaks")
+
+  tibble(
+    n_samples = n_distinct(peak_table$sample),
+    total_peaks = nrow(peak_table),
+    min_peaks_per_sample = min(peak_counts$n_peaks),
+    median_peaks_per_sample = median(peak_counts$n_peaks),
+    max_peaks_per_sample = max(peak_counts$n_peaks),
+    median_peak_x = median(peak_table$peak_x, na.rm = TRUE)
+  )
+}
+
+render_or_include_plot <- function(plot_path, plot_builder, width, height, element_id, dpi = 300) {
   should_rebuild <- force_rebuild_figures || !reuse_existing_figures || !file.exists(plot_path)
 
   if (should_rebuild) {
@@ -243,131 +492,204 @@ render_or_include_plot <- function(plot_path, plot_builder, width, height, dpi =
     )
   }
 
-  knitr::include_graphics(plot_path)
-}
-```
-
-# Build or Load Cached GatingSet
-
-```{r gating-example}
-gs <- if (dir.exists(gs_cache_path)) {
-  load_gs(gs_cache_path)
-} else {
-  built_gs <- build_gs(
-    flow_files = flow_files,
-    qc_channels = chs,
-    dna_channels = dna_ch,
-    dna_cofactor = dna_cofactor
+  plot_src <- gsub("\\\\", "/", plot_path)
+  sprintf(
+    '<img src="%s" id="%s" class="zoomable-plot" style="width:100%%;" />',
+    plot_src,
+    element_id
   )
-  save_gs(built_gs, path = gs_cache_path, backend_opt = "copy")
-  built_gs
+}
+
+build_fsc_ssc_plot <- function(gs) {
+  p_fsc_raw <- ggcyto(gs, subset = "root", aes(x = `FSC-A`, y = `SSC-A`)) +
+    geom_hex(bins = 60) +
+    labs(title = "FSC vs SSC (Raw)") +
+    theme_bw() +
+    theme(strip.text = element_text(size = 8))
+
+  p_fsc_filtered <- ggcyto(gs, subset = "Singlets", aes(x = `FSC-A`, y = `SSC-A`)) +
+    geom_hex(bins = 60) +
+    labs(title = "FSC vs SSC (Filtered)") +
+    theme_bw() +
+    theme(strip.text = element_text(size = 8))
+
+  as.ggplot(p_fsc_raw) + as.ggplot(p_fsc_filtered)
+}
+
+build_dna_scatter_plot <- function(gs, dna_channels) {
+  p_dna_raw <- ggcyto(gs, subset = "root", aes(x = .data[[dna_channels[1]]], y = .data[[dna_channels[2]]])) +
+    geom_hex(bins = 60) +
+    labs(title = "DNA Scatter (Raw)") +
+    theme_bw() +
+    theme(strip.text = element_text(size = 8))
+
+  p_dna_filtered <- ggcyto(gs, subset = "Singlets", aes(x = .data[[dna_channels[1]]], y = .data[[dna_channels[2]]])) +
+    geom_hex(bins = 60) +
+    labs(title = "DNA Scatter (Filtered Singlets)") +
+    theme_bw() +
+    theme(strip.text = element_text(size = 8))
+
+  as.ggplot(p_dna_raw) + as.ggplot(p_dna_filtered)
+}
+
+build_dna_density_plot <- function(gs, dna_channels) {
+  p_density_raw <- ggcyto(gs, subset = "root", aes(x = .data[[dna_channels[1]]])) +
+    geom_density(fill = "gray50", alpha = 0.5, linewidth = 0.5) +
+    labs(title = "DNA Density (Raw)", y = "Density") +
+    theme_bw() +
+    theme(strip.text = element_text(size = 8))
+
+  p_density_filtered <- ggcyto(gs, subset = "Singlets", aes(x = .data[[dna_channels[1]]])) +
+    geom_density(fill = "gray50", alpha = 0.5, linewidth = 0.5) +
+    labs(title = "DNA Density (Filtered Singlets)", y = "Density") +
+    theme_bw() +
+    theme(strip.text = element_text(size = 8))
+
+  as.ggplot(p_density_raw) + as.ggplot(p_density_filtered)
 }
 ```
 
-# Counts
+# Build or Load Dataset Results
+
+```{r dataset-results}
+dataset_results <- lapply(dataset_configs, build_or_load_dataset)
+dataset_counts <- bind_rows(lapply(dataset_results, `[[`, "gate_counts"))
+dataset_peak_table <- bind_rows(lapply(dataset_results, `[[`, "peak_table"))
+```
+
+# Cross-Dataset Gate Counts
 
 ```{r gate-counts}
-gate_counts <- as_tibble(gs_pop_get_count_fast(gs))
+dataset_gate_overview <- bind_rows(lapply(dataset_results, function(res) {
+  gate_summary <- dataset_gate_summary(res$gate_counts)
+  gate_summary$dataset_id <- res$config$dataset_id
+  gate_summary
+})) %>%
+  select(dataset_id, everything())
+
+if (should_print_table(dataset_gate_overview)) {
+  kable(dataset_gate_overview)
+}
 ```
 
-# DNA Peak Summary
+# Cross-Dataset DNA Peak Summary
 
 ```{r peak-summary}
-peak_table <- lapply(sampleNames(gs), function(sn) {
-  ff <- gh_pop_get_data(gs[[sn]], "Singlets")
-  pk <- find_density_peaks(exprs(ff)[, dna_ch[1]])
-  pk <- pk[order(pk$x), , drop = FALSE]
-
-  tibble(
-    sample = sn,
-    peak_x = pk$x,
-    peak_density = pk$y
+dataset_peak_overview <- bind_rows(lapply(dataset_results, function(res) {
+  peak_summary <- dataset_peak_summary(res$peak_table)
+  peak_summary$dataset_id <- res$config$dataset_id
+  peak_summary
+})) %>%
+  select(
+    dataset_id,
+    n_samples,
+    total_peaks,
+    min_peaks_per_sample,
+    median_peaks_per_sample,
+    median_peak_x
   )
-})
 
-peak_table <- bind_rows(peak_table)
+if (should_print_table(dataset_peak_overview)) {
+  kable(dataset_peak_overview)
+}
 ```
 
-# Plots
+# Dataset Details
 
-```{r fsc-ssc-plots, dpi=300, fig.retina=2, fig.width=21, fig.height=14, out.extra='id="fsc_ssc_plot"'}
-render_or_include_plot(
-  plot_path = plot_paths$fsc_ssc,
-  width = 21,
-  height = 14,
-  dpi = 300,
-  plot_builder = function() {
-    p_fsc_raw <- ggcyto(gs, subset = "root", aes(x = `FSC-A`, y = `SSC-A`)) +
-      geom_hex(bins = 60) +
-      labs(title = "FSC vs SSC (Raw)") +
-      theme_bw() +
-      theme(strip.text = element_text(size = 8))
+```{r dataset-sections, results='asis'}
+for (res in dataset_results) {
+  cfg <- res$config
+  gs <- res$gs
 
-    p_fsc_filtered <- ggcyto(gs, subset = "Singlets", aes(x = `FSC-A`, y = `SSC-A`)) +
-      geom_hex(bins = 60) +
-      labs(title = "FSC vs SSC (Filtered)") +
-      theme_bw() +
-      theme(strip.text = element_text(size = 8))
+  cat(sprintf("## %s\n\n", cfg$dataset_name))
+  cat(sprintf("- Dataset id: `%s`\n", cfg$dataset_id))
+  cat(sprintf("- Source directory: `%s`\n", cfg$dataset_dir))
+  cat(sprintf("- Cache path: `%s`\n", cfg$gs_cache_path))
+  cat(sprintf("- Figure directory: `%s`\n\n", cfg$figure_dir))
 
-    as.ggplot(p_fsc_raw) + as.ggplot(p_fsc_filtered)
+  cat("### Input Summary\n\n")
+  print(kable(dataset_input_summary(res$input_tbl)))
+  cat("\n")
+
+  gate_summary <- dataset_gate_summary(res$gate_counts)
+  if (should_print_table(gate_summary)) {
+    cat("### Gate Count Summary\n\n")
+    print(kable(gate_summary))
+    cat("\n")
   }
-)
-```
 
-```{r dna-scatter-plots, dpi=300, fig.retina=2, fig.width=21, fig.height=14, out.extra='id="dna_scatter_plot"'}
-render_or_include_plot(
-  plot_path = plot_paths$dna_scatter,
-  width = 21,
-  height = 14,
-  dpi = 300,
-  plot_builder = function() {
-    p_dna_raw <- ggcyto(gs, subset = "root", aes(x = `450-Violet C-A`, y = `450-Violet C-H`)) +
-      geom_hex(bins = 60) +
-      labs(title = "DNA Scatter (Raw)") +
-      theme_bw() +
-      theme(strip.text = element_text(size = 8))
-
-    p_dna_filtered <- ggcyto(gs, subset = "Singlets", aes(x = `450-Violet C-A`, y = `450-Violet C-H`)) +
-      geom_hex(bins = 60) +
-      labs(title = "DNA Scatter (Filtered Singlets)") +
-      theme_bw() +
-      theme(strip.text = element_text(size = 8))
-
-    as.ggplot(p_dna_raw) + as.ggplot(p_dna_filtered)
+  peak_summary <- dataset_peak_summary(res$peak_table)
+  if (should_print_table(peak_summary)) {
+    cat("### DNA Peak Summary\n\n")
+    print(kable(peak_summary))
+    cat("\n")
   }
-)
-```
 
-```{r dna-density-plots, dpi=300, fig.retina=2, fig.width=21, fig.height=14, out.extra='id="dna_density_plot"'}
-render_or_include_plot(
-  plot_path = plot_paths$dna_density,
-  width = 21,
-  height = 14,
-  dpi = 300,
-  plot_builder = function() {
-    p_density_raw <- ggcyto(gs, subset = "root", aes(x = `450-Violet C-A`)) +
-      geom_density(fill = "gray50", alpha = 0.5, linewidth = 0.5) +
-      labs(title = "DNA Density (Raw)", y = "Density") +
-      theme_bw() +
-      theme(strip.text = element_text(size = 8))
-
-    p_density_filtered <- ggcyto(gs, subset = "Singlets", aes(x = `450-Violet C-A`)) +
-      geom_density(fill = "gray50", alpha = 0.5, linewidth = 0.5) +
-      labs(title = "DNA Density (Filtered Singlets)", y = "Density") +
-      theme_bw() +
-      theme(strip.text = element_text(size = 8))
-
-    as.ggplot(p_density_raw) + as.ggplot(p_density_filtered)
+  if (should_print_table(res$input_tbl)) {
+    cat("### Input Detail\n\n")
+    print(kable(res$input_tbl))
+    cat("\n")
   }
-)
+
+  if (should_print_table(res$gate_counts)) {
+    cat("### Gate Count Detail\n\n")
+    print(kable(res$gate_counts))
+    cat("\n")
+  }
+
+  if (should_print_table(res$peak_table)) {
+    cat("### DNA Peak Detail\n\n")
+    print(kable(res$peak_table))
+    cat("\n")
+  }
+  cat("\n")
+
+  cat("### FSC vs SSC\n\n")
+  cat(
+    render_or_include_plot(
+      plot_path = cfg$plot_paths$fsc_ssc,
+      width = 21,
+      height = 14,
+      dpi = 300,
+      element_id = sprintf("%s-fsc-ssc-plot", cfg$dataset_id),
+      plot_builder = function() build_fsc_ssc_plot(gs)
+    )
+  )
+  cat("\n\n")
+
+  cat("### DNA Scatter\n\n")
+  cat(
+    render_or_include_plot(
+      plot_path = cfg$plot_paths$dna_scatter,
+      width = 21,
+      height = 14,
+      dpi = 300,
+      element_id = sprintf("%s-dna-scatter-plot", cfg$dataset_id),
+      plot_builder = function() build_dna_scatter_plot(gs, cfg$dna_channels)
+    )
+  )
+  cat("\n\n")
+
+  cat("### DNA Density\n\n")
+  cat(
+    render_or_include_plot(
+      plot_path = cfg$plot_paths$dna_density,
+      width = 21,
+      height = 14,
+      dpi = 300,
+      element_id = sprintf("%s-dna-density-plot", cfg$dataset_id),
+      plot_builder = function() build_dna_density_plot(gs, cfg$dna_channels)
+    )
+  )
+  cat("\n\n")
+}
 ```
 
 ```{r activate-zoom, results='asis'}
 cat('
 <script>
 (function() {
-  ["fsc_ssc_plot", "dna_scatter_plot", "dna_density_plot"].forEach(function(id) {
-    var el = document.getElementById(id);
+  Array.prototype.forEach.call(document.querySelectorAll(".zoomable-plot"), function(el) {
     if (!el || typeof panzoom === "undefined") return;
     panzoom(el, { maxZoom: 10, minZoom: 1 });
   });
