@@ -3,3 +3,6 @@ processed_data/
 figure
 *.html
 *.exe
+workflow/cache/
+workflow/workflow/
+workflow/tmp_*.md

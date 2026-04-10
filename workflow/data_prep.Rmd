@@ -8,7 +8,13 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_knit$set(root.dir = "./")
+input_path <- knitr::current_input()
+workflow_dir <- if (length(input_path) == 0) getwd() else dirname(input_path)
+project_root <- normalizePath(file.path(workflow_dir, ".."), winslash = "/", mustWork = TRUE)
+if (!dir.exists(file.path(project_root, "data")) && dir.exists(file.path(getwd(), "data"))) {
+  project_root <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+}
+knitr::opts_knit$set(root.dir = project_root)
 knitr::opts_chunk$set(
   echo = FALSE,
   warning = FALSE,
@@ -71,6 +77,7 @@ discover_dataset_dirs <- function(root_path) {
   dirs <- list.dirs(root_path, recursive = FALSE, full.names = TRUE)
   dirs <- dirs[!startsWith(basename(dirs), ".")]
   dirs <- dirs[basename(dirs) != "cache"]
+  dirs <- dirs[!grepl("hypoxia", basename(dirs), ignore.case = TRUE)]
   sort(normalizePath(dirs, winslash = "/", mustWork = TRUE))
 }
 
@@ -119,6 +126,7 @@ dataset_tbl <- dataset_tbl %>%
     cache_dir = file.path(processed_root, dataset_id),
     gs_cache_path = file.path(cache_dir, "gating_gs"),
     figure_dir = file.path(figure_root, dataset_id),
+    sample_metadata_export_path = file.path(cache_dir, "sample_metadata.csv"),
     dna_vector_export_path = file.path(cache_dir, "filtered_dna_area_vectors.rds")
   )
 
@@ -145,6 +153,7 @@ dataset_configs <- lapply(seq_len(nrow(dataset_tbl)), function(i) {
     cache_dir = dataset_tbl$cache_dir[[i]],
     gs_cache_path = dataset_tbl$gs_cache_path[[i]],
     figure_dir = dataset_tbl$figure_dir[[i]],
+    sample_metadata_export_path = dataset_tbl$sample_metadata_export_path[[i]],
     dna_vector_export_path = dataset_tbl$dna_vector_export_path[[i]],
     flow_files = dataset_tbl$flow_files[[i]],
     plot_paths = dataset_tbl$plot_paths[[i]],
@@ -259,17 +268,6 @@ dna_singlet_vec <- function(ff, a = "450-Violet C-A", h = "450-Violet C-H", nmad
   keep <- rep(FALSE, nrow(xy))
   keep[which(ok)[keep_ok]] <- TRUE
   keep
-}
-
-find_density_peaks <- function(x, bw = "nrd0") {
-  x <- x[is.finite(x)]
-  if (length(x) < 2) {
-    return(data.frame(x = numeric(0), y = numeric(0)))
-  }
-
-  d <- density(x, bw = bw)
-  idx <- which(diff(sign(diff(d$y))) == -2) + 1L
-  data.frame(x = d$x[idx], y = d$y[idx])
 }
 
 process_masks <- function(ff_raw, qc_channels, dna_channels, IT_limit = 0.65, dna_cofactor = 500, nmads = 4) {
@@ -387,34 +385,24 @@ build_or_load_dataset <- function(cfg) {
     built_gs
   }
 
+  sample_metadata <- parse_sample_metadata(cfg$flow_files)
+  write.csv(sample_metadata, cfg$sample_metadata_export_path, row.names = FALSE)
+
   input_tbl <- tibble(
     dataset_id = cfg$dataset_id,
     dataset_name = cfg$dataset_name,
     sample_name = basename(cfg$flow_files),
     source_path = cfg$flow_files
-  )
+  ) %>%
+    left_join(sample_metadata, by = "sample_name")
 
   gate_counts <- as_tibble(gs_pop_get_count_fast(gs)) %>%
     mutate(
       dataset_id = cfg$dataset_id,
       dataset_name = cfg$dataset_name,
       .before = 1
-    )
-
-  peak_table <- lapply(sampleNames(gs), function(sn) {
-    ff <- gh_pop_get_data(gs[[sn]], "Singlets")
-    pk <- find_density_peaks(exprs(ff)[, cfg$dna_channels[1]])
-    pk <- pk[order(pk$x), , drop = FALSE]
-
-    tibble(
-      dataset_id = cfg$dataset_id,
-      dataset_name = cfg$dataset_name,
-      sample = sn,
-      peak_x = pk$x,
-      peak_density = pk$y
-    )
-  })
-  peak_table <- bind_rows(peak_table)
+    ) %>%
+    add_sample_metadata(sample_metadata)
 
   flow_file_map <- setNames(cfg$flow_files, tools::file_path_sans_ext(basename(cfg$flow_files)))
   sample_keys <- tools::file_path_sans_ext(basename(sampleNames(gs)))
@@ -454,10 +442,45 @@ build_or_load_dataset <- function(cfg) {
     config = cfg,
     gs = gs,
     input_tbl = input_tbl,
+    sample_metadata = sample_metadata,
     gate_counts = gate_counts,
-    peak_table = peak_table,
     filtered_dna_area = filtered_dna_area
   )
+}
+
+parse_sample_metadata <- function(sample_name) {
+  sample_id <- tools::file_path_sans_ext(basename(sample_name))
+  cell_line <- rep(NA_character_, length(sample_id))
+  condition <- rep(NA_character_, length(sample_id))
+
+  cell_line[sample_id == "Sample_CEN"] <- "CEN"
+
+  sum159_idx <- grepl("^Sample_SUM159_", sample_id)
+  cell_line[sum159_idx] <- "SUM159"
+
+  condition[sum159_idx] <- sub("^Sample_SUM159_([0-9]+_)?", "", sample_id[sum159_idx])
+
+  tibble(
+    sample_name = basename(sample_name),
+    sample_id = sample_id,
+    cell_line = cell_line,
+    condition = condition
+  )
+}
+
+add_sample_metadata <- function(tbl, metadata_tbl) {
+  sample_col <- intersect(c("sample_name", "name", "Name", "sample", "Sample"), names(tbl))[1]
+  if (is.na(sample_col)) {
+    return(tbl)
+  }
+
+  tbl %>%
+    mutate(.sample_id = tools::file_path_sans_ext(basename(.data[[sample_col]]))) %>%
+    left_join(
+      select(metadata_tbl, sample_id, cell_line, condition),
+      by = c(".sample_id" = "sample_id")
+    ) %>%
+    select(-.sample_id)
 }
 
 should_print_table <- function(tbl, max_rows = 12, max_cols = 6) {
@@ -469,9 +492,17 @@ dataset_input_summary <- function(input_tbl) {
     dataset_id = dplyr::first(input_tbl$dataset_id),
     dataset_name = dplyr::first(input_tbl$dataset_name),
     n_files = nrow(input_tbl),
+    cell_lines = paste(sort(unique(na.omit(input_tbl$cell_line))), collapse = ", "),
+    conditions = paste(sort(unique(na.omit(input_tbl$condition))), collapse = ", "),
     first_sample = dplyr::first(input_tbl$sample_name),
     last_sample = dplyr::last(input_tbl$sample_name)
   )
+}
+
+dataset_metadata_summary <- function(input_tbl) {
+  input_tbl %>%
+    count(cell_line, condition, name = "n_files") %>%
+    arrange(cell_line, condition)
 }
 
 dataset_gate_summary <- function(gate_counts) {
@@ -494,29 +525,12 @@ dataset_gate_summary <- function(gate_counts) {
     rename(population = 1)
 }
 
-dataset_peak_summary <- function(peak_table) {
-  if (nrow(peak_table) == 0) {
-    return(tibble(note = "No peaks detected."))
-  }
-
-  peak_counts <- peak_table %>%
-    count(sample, name = "n_peaks")
-
-  tibble(
-    n_samples = n_distinct(peak_table$sample),
-    total_peaks = nrow(peak_table),
-    min_peaks_per_sample = min(peak_counts$n_peaks),
-    median_peaks_per_sample = median(peak_counts$n_peaks),
-    max_peaks_per_sample = max(peak_counts$n_peaks),
-    median_peak_x = median(peak_table$peak_x, na.rm = TRUE)
-  )
-}
-
-dataset_export_summary <- function(filtered_dna_area, export_path) {
+dataset_export_summary <- function(filtered_dna_area, dna_vector_export_path, metadata_export_path) {
   vector_lengths <- lengths(filtered_dna_area$raw)
 
   tibble(
-    export_path = export_path,
+    dna_vector_export_path = dna_vector_export_path,
+    metadata_export_path = metadata_export_path,
     n_samples = length(filtered_dna_area$raw),
     min_vector_length = min(vector_lengths),
     median_vector_length = median(vector_lengths),
@@ -541,7 +555,8 @@ render_or_include_plot <- function(plot_path, plot_builder, width, height, eleme
     )
   }
 
-  plot_src <- gsub("\\\\", "/", plot_path)
+  plot_src <- file.path("..", plot_path)
+  plot_src <- gsub("\\\\", "/", plot_src)
   sprintf(
     '<img src="%s" id="%s" class="zoomable-plot" style="width:100%%;" />',
     plot_src,
@@ -602,8 +617,6 @@ build_dna_density_plot <- function(gs, dna_channels) {
 
 ```{r dataset-results}
 dataset_results <- lapply(dataset_configs, build_or_load_dataset)
-dataset_counts <- bind_rows(lapply(dataset_results, `[[`, "gate_counts"))
-dataset_peak_table <- bind_rows(lapply(dataset_results, `[[`, "peak_table"))
 ```
 
 # Cross-Dataset Gate Counts
@@ -621,25 +634,18 @@ if (should_print_table(dataset_gate_overview)) {
 }
 ```
 
-# Cross-Dataset DNA Peak Summary
+# Cross-Dataset Metadata
 
-```{r peak-summary}
-dataset_peak_overview <- bind_rows(lapply(dataset_results, function(res) {
-  peak_summary <- dataset_peak_summary(res$peak_table)
-  peak_summary$dataset_id <- res$config$dataset_id
-  peak_summary
+```{r metadata-summary}
+dataset_metadata_overview <- bind_rows(lapply(dataset_results, function(res) {
+  metadata_summary <- dataset_metadata_summary(res$input_tbl)
+  metadata_summary$dataset_id <- res$config$dataset_id
+  metadata_summary
 })) %>%
-  select(
-    dataset_id,
-    n_samples,
-    total_peaks,
-    min_peaks_per_sample,
-    median_peaks_per_sample,
-    median_peak_x
-  )
+  select(dataset_id, everything())
 
-if (should_print_table(dataset_peak_overview)) {
-  kable(dataset_peak_overview)
+if (should_print_table(dataset_metadata_overview)) {
+  kable(dataset_metadata_overview)
 }
 ```
 
@@ -660,6 +666,13 @@ for (res in dataset_results) {
   print(kable(dataset_input_summary(res$input_tbl)))
   cat("\n")
 
+  metadata_summary <- dataset_metadata_summary(res$input_tbl)
+  if (should_print_table(metadata_summary)) {
+    cat("### Metadata Summary\n\n")
+    print(kable(metadata_summary))
+    cat("\n")
+  }
+
   gate_summary <- dataset_gate_summary(res$gate_counts)
   if (should_print_table(gate_summary)) {
     cat("### Gate Count Summary\n\n")
@@ -667,14 +680,11 @@ for (res in dataset_results) {
     cat("\n")
   }
 
-  peak_summary <- dataset_peak_summary(res$peak_table)
-  if (should_print_table(peak_summary)) {
-    cat("### DNA Peak Summary\n\n")
-    print(kable(peak_summary))
-    cat("\n")
-  }
-
-  export_summary <- dataset_export_summary(res$filtered_dna_area, cfg$dna_vector_export_path)
+  export_summary <- dataset_export_summary(
+    res$filtered_dna_area,
+    cfg$dna_vector_export_path,
+    cfg$sample_metadata_export_path
+  )
   if (should_print_table(export_summary)) {
     cat("### DNA-Area Export\n\n")
     print(kable(export_summary))
@@ -692,13 +702,6 @@ for (res in dataset_results) {
     print(kable(res$gate_counts))
     cat("\n")
   }
-
-  if (should_print_table(res$peak_table)) {
-    cat("### DNA Peak Detail\n\n")
-    print(kable(res$peak_table))
-    cat("\n")
-  }
-  cat("\n")
 
   cat("### FSC vs SSC\n\n")
   cat(

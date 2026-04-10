@@ -1,0 +1,710 @@
+---
+title: "Fixed-Init Anoxia Checkpoint"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r setup, include=FALSE}
+input_path <- knitr::current_input()
+workflow_dir <- if (length(input_path) == 0) getwd() else dirname(input_path)
+project_root <- normalizePath(file.path(workflow_dir, ".."), winslash = "/", mustWork = TRUE)
+if (!dir.exists(file.path(project_root, "data")) && dir.exists(file.path(getwd(), "data"))) {
+  project_root <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+}
+knitr::opts_knit$set(root.dir = project_root)
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  out.width = "100%",
+  cache.path = "workflow/cache/fixed_init_anoxia_checkpoint/"
+)
+```
+
+# Goal
+
+Explore the archived fixed-initialization Stan optimization checkpoint for the
+anoxia-only subset.
+
+This was chosen because - unlike the LTEE experiments ('hypoxia' samples), the CEN peaks all seemed to be in exactly the same location here, and the 2N/4N peaks appeared pretty consistent too.
+
+This document reads the optimizer CSV from
+`results/2026-04-10-fixed-init-anoxia/`, reconstructs the fitted mixture curve
+from the saved parameters, and overlays it on the observed DNA-area histograms.
+
+```{r libraries}
+library(ggplot2)
+library(knitr)
+```
+
+```{r paths}
+experiment_filter <- "anoxia"
+checkpoint_dir <- file.path("results", "2026-04-10-fixed-init-anoxia")
+optimizer_csv <- file.path(checkpoint_dir, "fixed_init_optimize-1.csv")
+dye_ratio_optimizer_csv <- file.path(
+  "processed_data",
+  "stan_optimize_fixed_init_dye_ratio_anoxia",
+  "fixed_init_dye_ratio_optimize-1.csv"
+)
+stan_data_path <- file.path("processed_data", "stan_data.Rds")
+sample_metadata_path <- file.path("processed_data", "anoxia-flowcytometry", "sample_metadata.csv")
+
+stopifnot(file.exists(optimizer_csv))
+stopifnot(file.exists(dye_ratio_optimizer_csv))
+stopifnot(file.exists(stan_data_path))
+stopifnot(file.exists(sample_metadata_path))
+```
+
+```{r helpers}
+subset_stan_bundle_by_experiment <- function(stan_data, lut, experiment_pattern) {
+  keep_experiments <- grepl(experiment_pattern, lut$experiment$experiment_name, ignore.case = TRUE)
+  if (!any(keep_experiments)) {
+    stop(sprintf("No experiments matched pattern '%s'.", experiment_pattern))
+  }
+
+  old_exp_ids <- lut$experiment$experiment_id[keep_experiments]
+  keep_samples <- lut$sample$experiment_id %in% old_exp_ids
+  old_sample_ids <- lut$sample$sample_id[keep_samples]
+  keep_bins <- stan_data$sampleID %in% old_sample_ids
+
+  exp_map <- setNames(seq_along(old_exp_ids), old_exp_ids)
+  sample_map <- setNames(seq_along(old_sample_ids), old_sample_ids)
+
+  experiment_lut <- lut$experiment[keep_experiments, , drop = FALSE]
+  experiment_lut$experiment_id <- seq_len(nrow(experiment_lut))
+
+  sample_lut <- lut$sample[keep_samples, , drop = FALSE]
+  sample_lut$sample_id <- seq_len(nrow(sample_lut))
+  sample_lut$experiment_id <- unname(exp_map[as.character(sample_lut$experiment_id)])
+
+  stan_data$areaDNA_bin_center <- stan_data$areaDNA_bin_center[keep_bins]
+  stan_data$count <- stan_data$count[keep_bins]
+  stan_data$expID <- unname(exp_map[as.character(stan_data$expID[keep_bins])])
+  stan_data$sampleID <- unname(sample_map[as.character(stan_data$sampleID[keep_bins])])
+  stan_data$sampleExpID <- unname(exp_map[as.character(lut$sample$experiment_id[keep_samples])])
+  stan_data$N <- length(stan_data$count)
+  stan_data$N_exp <- nrow(experiment_lut)
+  stan_data$N_sample <- nrow(sample_lut)
+
+  list(
+    stan_data = stan_data,
+    lut = list(
+      experiment = experiment_lut,
+      sample = sample_lut
+    )
+  )
+}
+
+extract_indexed_vector <- function(row_df, prefix, n) {
+  vapply(seq_len(n), function(i) row_df[[sprintf("%s.%d", prefix, i)]], numeric(1))
+}
+
+extract_theta_matrix <- function(row_df, n_sample) {
+  theta <- matrix(NA_real_, nrow = n_sample, ncol = 7)
+  for (s in seq_len(n_sample)) {
+    for (k in seq_len(7)) {
+      theta[s, k] <- row_df[[sprintf("theta.%d.%d", s, k)]]
+    }
+  }
+  theta
+}
+
+s_phase_density <- function(x, lower_peak, upper_peak, n_subpeaks) {
+  width <- upper_peak - lower_peak
+  if (!is.finite(width) || width <= 0) {
+    return(0)
+  }
+  dnorm(x, mean = 0.5 * (lower_peak + upper_peak), sd = 0.5 * width)
+}
+
+build_overlay_df <- function(stan_data, lut, mu_cen, ratio_tumor_cen_sample, R_4n_sample, R_8n_sample, cv, theta) {
+  x <- stan_data$areaDNA_bin_center
+  bin_width <- diff(sort(unique(x)))[1]
+
+  plot_df <- data.frame(
+    areaDNA_bin_center = stan_data$areaDNA_bin_center,
+    count = stan_data$count,
+    expID = stan_data$expID,
+    sampleID = stan_data$sampleID,
+    stringsAsFactors = FALSE
+  )
+
+  sample_totals <- aggregate(count ~ sampleID, data = plot_df, FUN = sum)
+  names(sample_totals)[2] <- "sample_total"
+  plot_df <- merge(plot_df, sample_totals, by = "sampleID", sort = FALSE)
+
+  plot_df$mixture_count <- mapply(
+    FUN = function(x_i, sample_id, exp_id, sample_total) {
+      sig_cen <- mu_cen[exp_id] * cv
+      mu_2n <- mu_cen[exp_id] * ratio_tumor_cen_sample[sample_id]
+      mu_4n <- mu_2n * R_4n_sample[sample_id]
+      mu_8n <- mu_4n * R_8n_sample[sample_id]
+      sig_2n <- mu_2n * cv
+      sig_4n <- mu_4n * cv
+      sig_8n <- mu_8n * cv
+
+      density_val <- theta[sample_id, 1] * dnorm(x_i, mean = mu_cen[exp_id], sd = sig_cen) +
+        theta[sample_id, 2] * dnorm(x_i, mean = mu_2n, sd = sig_2n) +
+        theta[sample_id, 3] * dnorm(x_i, mean = mu_4n, sd = sig_4n) +
+        theta[sample_id, 4] * dnorm(x_i, mean = mu_8n, sd = sig_8n) +
+        theta[sample_id, 5] * s_phase_density(x_i, mu_2n, mu_4n, stan_data$N_s_phase) +
+        theta[sample_id, 6] * s_phase_density(x_i, mu_4n, mu_8n, stan_data$N_s_phase) +
+        theta[sample_id, 7] * dnorm(x_i, mean = 2 * mu_cen[exp_id], sd = sqrt(2) * sig_cen)
+
+      sample_total * bin_width * density_val
+    },
+    x_i = plot_df$areaDNA_bin_center,
+    sample_id = plot_df$sampleID,
+    exp_id = plot_df$expID,
+    sample_total = plot_df$sample_total
+  )
+
+  peak_df <- data.frame(
+    sampleID = seq_len(nrow(lut$sample)),
+    expID = lut$sample$experiment_id,
+    stringsAsFactors = FALSE
+  )
+  peak_df$mu_cen <- mu_cen[peak_df$expID]
+  peak_df$mu_2n <- peak_df$mu_cen * ratio_tumor_cen_sample[peak_df$sampleID]
+  peak_df$mu_4n <- peak_df$mu_2n * R_4n_sample[peak_df$sampleID]
+  peak_df$mu_8n <- peak_df$mu_4n * R_8n_sample[peak_df$sampleID]
+  peak_df$mu_4n_ratio_2 <- 2 * peak_df$mu_2n
+
+  plot_df <- merge(
+    plot_df,
+    lut$sample[, c("sample_id", "sample_name", "experiment_name")],
+    by.x = "sampleID",
+    by.y = "sample_id",
+    all.x = TRUE,
+    sort = FALSE
+  )
+
+  plot_df <- merge(
+    plot_df,
+    peak_df[, c("sampleID", "mu_cen", "mu_2n", "mu_4n", "mu_8n", "mu_4n_ratio_2")],
+    by = "sampleID",
+    all.x = TRUE,
+    sort = FALSE
+  )
+
+  plot_df$sample_label <- sprintf("%s | %s", plot_df$experiment_name, plot_df$sample_name)
+  plot_df
+}
+
+add_sample_metadata <- function(plot_df, sample_metadata) {
+  sample_metadata$sample_key <- tools::file_path_sans_ext(basename(sample_metadata$sample_name))
+
+  metadata_cols <- c("sample_key", "sample_id", "cell_line", "condition")
+  plot_df <- merge(
+    plot_df,
+    sample_metadata[, metadata_cols],
+    by.x = "sample_name",
+    by.y = "sample_key",
+    all.x = TRUE,
+    sort = FALSE
+  )
+
+  names(plot_df)[names(plot_df) == "sample_id"] <- "metadata_sample_id"
+  plot_df$condition_plot <- ifelse(is.na(plot_df$condition), "Unannotated", plot_df$condition)
+  plot_df$is_control <- plot_df$condition_plot %in% c("2N_Control", "4N_Control") | plot_df$sample_name == "Sample_CEN"
+  plot_df
+}
+
+build_peak_line_df <- function(plot_df) {
+  peak_line_df <- unique(plot_df[, c(
+    "sample_label",
+    "mu_cen",
+    "mu_2n",
+    "mu_4n",
+    "mu_8n",
+    "mu_4n_ratio_2"
+  )])
+  rbind(
+    data.frame(sample_label = peak_line_df$sample_label, peak = "CEN", peak_location = peak_line_df$mu_cen),
+    data.frame(sample_label = peak_line_df$sample_label, peak = "Diploid G0/G1", peak_location = peak_line_df$mu_2n),
+    data.frame(sample_label = peak_line_df$sample_label, peak = "WGD+ G0/G1", peak_location = peak_line_df$mu_4n),
+    data.frame(sample_label = peak_line_df$sample_label, peak = "WGD+ G2/M", peak_location = peak_line_df$mu_8n),
+    data.frame(sample_label = peak_line_df$sample_label, peak = "WGD+ G0/G1 if ratio = 2", peak_location = peak_line_df$mu_4n_ratio_2)
+  )
+}
+
+plot_overlay_subset <- function(
+  subset_df,
+  bin_width,
+  plot_title,
+  subtitle_path
+) {
+  peak_line_df <- build_peak_line_df(subset_df)
+  peak_line_df$peak <- factor(
+    peak_line_df$peak,
+    levels = c("CEN", "Diploid G0/G1", "WGD+ G0/G1", "WGD+ G2/M", "WGD+ G0/G1 if ratio = 2")
+  )
+
+  ggplot(subset_df, aes(x = areaDNA_bin_center)) +
+    geom_col(aes(y = count), width = bin_width, fill = "grey82", color = "grey55", linewidth = 0.225) +
+    geom_line(aes(y = mixture_count), color = "#d94801", linewidth = 0.75) +
+    geom_vline(
+      data = peak_line_df,
+      aes(xintercept = peak_location, color = peak),
+      linetype = "dashed",
+      linewidth = 0.525
+    ) +
+    scale_color_manual(
+      name = "Peak guide",
+      values = c(
+        "CEN" = "#1b9e77",
+        "Diploid G0/G1" = "#7570b3",
+        "WGD+ G0/G1" = "#e7298a",
+        "WGD+ G2/M" = "#66a61e",
+        "WGD+ G0/G1 if ratio = 2" = "#e6ab02"
+      ),
+      guide = guide_legend(override.aes = list(linetype = "dashed", linewidth = 0.75))
+    ) +
+    facet_wrap(~ sample_label, scales = "free_y") +
+    labs(
+      title = plot_title,
+      subtitle = subtitle_path,
+      x = "Raw DNA area bin center",
+      y = "Bin count",
+      caption = "Hypothetical WGD+ G0/G1 line marks 2x the fitted diploid G0/G1 peak."
+    ) +
+    theme_bw(base_size = 13.5) +
+    theme(
+      strip.text = element_text(size = 10.5),
+      panel.grid.minor = element_blank()
+    )
+}
+
+plot_condition_overlay <- function(
+  plot_df,
+  condition_value,
+  bin_width,
+  title_prefix = "Fixed-init optimization checkpoint overlay",
+  subtitle_path = optimizer_csv
+) {
+  condition_df <- plot_df[plot_df$condition_plot == condition_value & !plot_df$is_control, , drop = FALSE]
+  if (nrow(condition_df) == 0) {
+    return(NULL)
+  }
+  plot_overlay_subset(
+    subset_df = condition_df,
+    bin_width = bin_width,
+    plot_title = sprintf("%s: %s", title_prefix, condition_value),
+    subtitle_path = subtitle_path
+  )
+}
+
+plot_controls_overlay <- function(
+  plot_df,
+  bin_width,
+  title_prefix = "Fixed-init optimization checkpoint overlay",
+  subtitle_path = optimizer_csv
+) {
+  controls_df <- plot_df[plot_df$is_control, , drop = FALSE]
+  if (nrow(controls_df) == 0) {
+    return(NULL)
+  }
+  plot_overlay_subset(
+    subset_df = controls_df,
+    bin_width = bin_width,
+    plot_title = sprintf("%s: controls", title_prefix),
+    subtitle_path = subtitle_path
+  )
+}
+
+mixture_cdf <- function(x, mu_cen, mu_2n, mu_4n, mu_8n, cv, theta_row) {
+  sig_cen <- mu_cen * cv
+  sig_2n <- mu_2n * cv
+  sig_4n <- mu_4n * cv
+  sig_8n <- mu_8n * cv
+
+  s12_mid <- 0.5 * (mu_2n + mu_4n)
+  s12_sd <- 0.5 * (mu_4n - mu_2n)
+  s48_mid <- 0.5 * (mu_4n + mu_8n)
+  s48_sd <- 0.5 * (mu_8n - mu_4n)
+
+  theta_row[1] * pnorm(x, mean = mu_cen, sd = sig_cen) +
+    theta_row[2] * pnorm(x, mean = mu_2n, sd = sig_2n) +
+    theta_row[3] * pnorm(x, mean = mu_4n, sd = sig_4n) +
+    theta_row[4] * pnorm(x, mean = mu_8n, sd = sig_8n) +
+    theta_row[5] * pnorm(x, mean = s12_mid, sd = s12_sd) +
+    theta_row[6] * pnorm(x, mean = s48_mid, sd = s48_sd) +
+    theta_row[7] * pnorm(x, mean = 2 * mu_cen, sd = sqrt(2) * sig_cen)
+}
+
+build_ecdf_df <- function(plot_df, theta, cv) {
+  sample_ids <- sort(unique(plot_df$sampleID))
+  ecdf_list <- vector("list", length(sample_ids))
+
+  for (i in seq_along(sample_ids)) {
+    sample_id <- sample_ids[i]
+    sample_df <- plot_df[plot_df$sampleID == sample_id, , drop = FALSE]
+    sample_df <- sample_df[order(sample_df$areaDNA_bin_center), ]
+    cumulative_observed <- cumsum(sample_df$count) / sample_df$sample_total[1]
+
+    predicted_cdf <- mixture_cdf(
+      x = sample_df$areaDNA_bin_center,
+      mu_cen = sample_df$mu_cen[1],
+      mu_2n = sample_df$mu_2n[1],
+      mu_4n = sample_df$mu_4n[1],
+      mu_8n = sample_df$mu_8n[1],
+      cv = cv,
+      theta_row = theta[sample_id, ]
+    )
+
+    sample_df$observed_ecdf <- cumulative_observed
+    sample_df$predicted_ecdf <- predicted_cdf
+    ecdf_list[[i]] <- sample_df
+  }
+
+  do.call(rbind, ecdf_list)
+}
+
+plot_condition_ecdf <- function(
+  ecdf_df,
+  condition_value,
+  title_prefix,
+  subtitle_path
+) {
+  condition_df <- ecdf_df[ecdf_df$condition_plot == condition_value & !ecdf_df$is_control, , drop = FALSE]
+  if (nrow(condition_df) == 0) {
+    return(NULL)
+  }
+  peak_line_df <- build_peak_line_df(condition_df)
+
+  ggplot(condition_df, aes(x = areaDNA_bin_center)) +
+    geom_step(aes(y = observed_ecdf), color = "grey35", linewidth = 0.55) +
+    geom_line(aes(y = predicted_ecdf), color = "#d94801", linewidth = 0.8) +
+    geom_vline(
+      data = peak_line_df,
+      aes(xintercept = peak_location),
+      linetype = "dashed",
+      color = "grey55",
+      linewidth = 0.45
+    ) +
+    facet_wrap(~ sample_label, scales = "free_x") +
+    labs(
+      title = sprintf("%s: %s", title_prefix, condition_value),
+      subtitle = subtitle_path,
+      x = "Raw DNA area bin center",
+      y = "ECDF"
+    ) +
+    coord_cartesian(ylim = c(0, 1)) +
+    theme_bw(base_size = 13.5) +
+    theme(
+      strip.text = element_text(size = 10.5),
+      panel.grid.minor = element_blank()
+    )
+}
+
+plot_controls_ecdf <- function(
+  ecdf_df,
+  title_prefix,
+  subtitle_path
+) {
+  controls_df <- ecdf_df[ecdf_df$is_control, , drop = FALSE]
+  if (nrow(controls_df) == 0) {
+    return(NULL)
+  }
+  peak_line_df <- build_peak_line_df(controls_df)
+
+  ggplot(controls_df, aes(x = areaDNA_bin_center)) +
+    geom_step(aes(y = observed_ecdf), color = "grey35", linewidth = 0.55) +
+    geom_line(aes(y = predicted_ecdf), color = "#d94801", linewidth = 0.8) +
+    geom_vline(
+      data = peak_line_df,
+      aes(xintercept = peak_location),
+      linetype = "dashed",
+      color = "grey55",
+      linewidth = 0.45
+    ) +
+    facet_wrap(~ sample_label, scales = "free_x") +
+    labs(
+      title = sprintf("%s: controls", title_prefix),
+      subtitle = subtitle_path,
+      x = "Raw DNA area bin center",
+      y = "ECDF"
+    ) +
+    coord_cartesian(ylim = c(0, 1)) +
+    theme_bw(base_size = 13.5) +
+    theme(
+      strip.text = element_text(size = 10.5),
+      panel.grid.minor = element_blank()
+    )
+}
+
+build_population_fraction_df <- function(theta, plot_df) {
+  sample_fraction_df <- data.frame(
+    sampleID = seq_len(nrow(theta)),
+    CEN = rowSums(theta[, c(1, 7), drop = FALSE]),
+    Diploid = rowSums(theta[, c(2, 5), drop = FALSE]),
+    WGD = rowSums(theta[, c(3, 4, 6), drop = FALSE])
+  )
+
+  sample_annotations <- unique(plot_df[, c("sampleID", "sample_name", "sample_label", "condition_plot", "is_control")])
+  sample_fraction_df <- merge(sample_fraction_df, sample_annotations, by = "sampleID", all.x = TRUE, sort = FALSE)
+
+  long_values <- stack(sample_fraction_df[, c("CEN", "Diploid", "WGD")])
+  fraction_df <- sample_fraction_df[rep(seq_len(nrow(sample_fraction_df)), 3), c(
+    "sampleID",
+    "sample_name",
+    "sample_label",
+    "condition_plot",
+    "is_control"
+  )]
+  fraction_df$population <- factor(long_values$ind, levels = c("CEN", "Diploid", "WGD"))
+  fraction_df$fraction <- long_values$values
+  fraction_df
+}
+
+plot_population_fractions <- function(fraction_df) {
+  sample_order_df <- unique(fraction_df[, c("sample_label", "condition_plot", "is_control")])
+  sample_order_df <- sample_order_df[order(sample_order_df$is_control, sample_order_df$condition_plot, sample_order_df$sample_label), ]
+  fraction_df$sample_label <- factor(fraction_df$sample_label, levels = sample_order_df$sample_label)
+
+  ggplot(fraction_df, aes(x = sample_label, y = fraction, fill = population)) +
+    geom_col(width = 0.82) +
+    facet_wrap(~ condition_plot, scales = "free_x") +
+    scale_fill_manual(values = c("CEN" = "#1b9e77", "Diploid" = "#7570b3", "WGD" = "#e7298a")) +
+    scale_y_continuous(labels = function(x) sprintf("%d%%", round(100 * x))) +
+    labs(
+      title = "Dye-ratio fit: population fractions by sample",
+      x = NULL,
+      y = "Population fraction",
+      fill = "Population"
+    ) +
+    theme_bw(base_size = 13.5) +
+    theme(
+      axis.text.x = element_blank(),
+      panel.grid.minor = element_blank()
+    )
+}
+
+build_dye_ratio_global_param_tbl <- function(opt_row, n_exp = 1L) {
+  scalar_tbl <- data.frame(
+    parameter = c(
+      "lp__",
+      "cv",
+      "beta",
+      "ratio_tumor_cen_geometric_mean",
+      "R_4n_geometric_mean",
+      "R_8n_geometric_mean"
+    ),
+    value = signif(c(
+      opt_row$lp__[1],
+      opt_row$cv[1],
+      opt_row$beta[1],
+      exp(opt_row$log_ratio_tumor_cen_mu[1]),
+      exp(opt_row$log_R_4n_mu[1]),
+      exp(opt_row$log_R_8n_mu[1])
+    ), 6)
+  )
+
+  vector_specs <- list(
+    mu_cen = n_exp,
+    cen_phase = 2L,
+    diploid_phase = 3L,
+    wgd_phase = 3L
+  )
+
+  vector_tbl <- do.call(
+    rbind,
+    lapply(names(vector_specs), function(prefix) {
+      n_vals <- vector_specs[[prefix]]
+      values <- extract_indexed_vector(opt_row, prefix, n_vals)
+      data.frame(
+        parameter = sprintf("%s[%d]", prefix, seq_len(n_vals)),
+        value = signif(values, 6)
+      )
+    })
+  )
+
+  rbind(scalar_tbl, vector_tbl)
+}
+```
+
+```{r load-data}
+stan_bundle <- readRDS(stan_data_path)
+stan_data <- stan_bundle$stan_data
+if (is.null(stan_data$N_s_phase)) {
+  stan_data$N_s_phase <- 3L
+}
+
+filtered_bundle <- subset_stan_bundle_by_experiment(
+  stan_data = stan_data,
+  lut = stan_bundle$lut,
+  experiment_pattern = experiment_filter
+)
+stan_data <- filtered_bundle$stan_data
+lut <- filtered_bundle$lut
+
+opt_row <- read.csv(optimizer_csv, comment.char = "#", check.names = FALSE)[1, , drop = FALSE]
+sample_metadata <- read.csv(sample_metadata_path, stringsAsFactors = FALSE)
+```
+
+# Checkpoint
+
+```{r checkpoint-summary}
+summary_tbl <- data.frame(
+  field = c(
+    "checkpoint_dir",
+    "optimizer_csv",
+    "sample_metadata",
+    "experiment_filter",
+    "N_exp",
+    "N_sample",
+    "N_bins",
+    "lp__",
+    "cv"
+  ),
+  value = c(
+    checkpoint_dir,
+    optimizer_csv,
+    sample_metadata_path,
+    experiment_filter,
+    stan_data$N_exp,
+    stan_data$N_sample,
+    stan_data$N,
+    signif(opt_row$lp__[1], 6),
+    signif(opt_row$cv[1], 6)
+  )
+)
+
+kable(summary_tbl)
+```
+
+# Histogram Overlay
+
+We fit a simple model to the data where the locations of all the peaks (CEN/CEN doublet/2N/4N/8N) were globally fixed among all samples. The only sample level variable was the fraction of the population considered to be CEN/diploid/WGD. The CEN peak was fit very well, and the 2N peak was also fit decently (with the exception of the 2N control and 4N control samples, which we still don't have a good theory of why these appear so different from everything else). But we were intrigued by the observation that all flow samples for a given condition had their 2N peak shifted (relative to the estimate) in the same way. It appears there was a strong condition-specific batch effect.
+
+```{r optimized-overlay-data, cache=TRUE}
+overlay_df <- build_overlay_df(
+  stan_data = stan_data,
+  lut = lut,
+  mu_cen = extract_indexed_vector(opt_row, "mu_cen", stan_data$N_exp),
+  ratio_tumor_cen_sample = extract_indexed_vector(opt_row, "ratio_tumor_cen_sample", stan_data$N_sample),
+  R_4n_sample = extract_indexed_vector(opt_row, "R_4n_sample", stan_data$N_sample),
+  R_8n_sample = extract_indexed_vector(opt_row, "R_8n_sample", stan_data$N_sample),
+  cv = opt_row$cv[1],
+  theta = extract_theta_matrix(opt_row, stan_data$N_sample)
+)
+overlay_df <- add_sample_metadata(overlay_df, sample_metadata)
+
+bin_width <- diff(sort(unique(overlay_df$areaDNA_bin_center)))[1]
+condition_levels <- sort(unique(overlay_df$condition_plot))
+```
+
+```{r optimized-overlay, fig.width=16, fig.height=8}
+
+print(plot_controls_overlay(overlay_df, bin_width))
+
+for (condition_value in condition_levels) {
+  print(plot_condition_overlay(overlay_df, condition_value, bin_width))
+}
+```
+
+# Dye-Ratio Fit
+
+Our working theory for these experiments is as follows:
+
+1) The CEN cells were prepared (fixed/stained) ONCE and then added to the (already fixed/stained) SUM-159 cells. This assumption is needed to explain why the CEN cells appear so consistent across all experiments.
+2) A fixed quantity of CEN cells were added to each SUM-159 sample.
+3) The ratio of DNA:nuclear dye is an important determinant of the location of the peaks. If there is insufficient dye to saturate the DNA (i.e. fully load all DNA binding sites with dye), then the location of the 2N/4N/8N peaks will move. 
+4) We can use the CEN/Sum-159 ratio to determine the relative quantity of tumor cells per-sample, and therefore estimate the relative amount of DNA per sample (it actually occurs to me now that this only works if the SUM-159 cells all have the same amount of DNA per cell, which they clearly don't - this suggests an improvement to the model to-be-presented).
+5) We introduce a model where the location of the non-CEN peaks is shifted proportional to the CEN/Sum-159 ratio.
+6) The model results in a really good fit! With some caveats...
+
+```{r dye-ratio-summary}
+dye_ratio_opt_row <- read.csv(dye_ratio_optimizer_csv, comment.char = "#", check.names = FALSE)[1, , drop = FALSE]
+
+dye_ratio_global_tbl <- build_dye_ratio_global_param_tbl(
+  opt_row = dye_ratio_opt_row,
+  n_exp = stan_data$N_exp
+)
+
+kable(dye_ratio_global_tbl, digits = 4)
+```
+
+```{r dye-ratio-overlay-data, cache=TRUE}
+dye_ratio_overlay_df <- build_overlay_df(
+  stan_data = stan_data,
+  lut = lut,
+  mu_cen = extract_indexed_vector(dye_ratio_opt_row, "mu_cen", stan_data$N_exp),
+  ratio_tumor_cen_sample = extract_indexed_vector(dye_ratio_opt_row, "ratio_tumor_cen_sample", stan_data$N_sample),
+  R_4n_sample = extract_indexed_vector(dye_ratio_opt_row, "R_4n_sample", stan_data$N_sample),
+  R_8n_sample = extract_indexed_vector(dye_ratio_opt_row, "R_8n_sample", stan_data$N_sample),
+  cv = dye_ratio_opt_row$cv[1],
+  theta = extract_theta_matrix(dye_ratio_opt_row, stan_data$N_sample)
+)
+dye_ratio_overlay_df <- add_sample_metadata(dye_ratio_overlay_df, sample_metadata)
+dye_ratio_theta <- extract_theta_matrix(dye_ratio_opt_row, stan_data$N_sample)
+```
+
+```{r dye-ratio-overlay, fig.width=16, fig.height=8}
+
+print(plot_controls_overlay(
+  dye_ratio_overlay_df,
+  bin_width,
+  title_prefix = "Dye-ratio fixed-init optimization overlay",
+  subtitle_path = dye_ratio_optimizer_csv
+))
+
+for (condition_value in condition_levels) {
+  print(plot_condition_overlay(
+    dye_ratio_overlay_df,
+    condition_value,
+    bin_width,
+    title_prefix = "Dye-ratio fixed-init optimization overlay",
+    subtitle_path = dye_ratio_optimizer_csv
+  ))
+}
+```
+
+# Population Fractions
+These broadly make sense. CEN is all CEN. Everything else is broadly diploid, except the anoxia only sample (which we already know is WGDish). THe other exceptions are the 2N and 4N controls, which... we're just ignoring for now.
+
+```{r dye-ratio-population-fractions-data, cache=TRUE}
+population_fraction_df <- build_population_fraction_df(
+  theta = dye_ratio_theta,
+  plot_df = dye_ratio_overlay_df
+)
+```
+
+```{r dye-ratio-population-fractions, fig.width=18, fig.height=9}
+print(plot_population_fractions(population_fraction_df))
+```
+
+# ECDF Diagnostics
+
+These diagnostics are very revealing. They show that the model predicted CEN/tumor ratio is way off in the 4N control condition, and a bit off in the anoxia condition (where WGD occurred). Basically what's happening is that in order to nail the peak locations, the model is deliberately assigning an incorrect CEN/tumor ratio. So either our theory isn't correct (or at least isn't quite the whole story), or the model for how CEN/tumor ratio impacts peak location is misspecified. 
+
+One other thing to note is that we just don't get the 8N peak at all, so that's certainly something to look at.
+
+```{r dye-ratio-ecdf-data, cache=TRUE}
+dye_ratio_ecdf_df <- build_ecdf_df(
+  plot_df = dye_ratio_overlay_df,
+  theta = dye_ratio_theta,
+  cv = dye_ratio_opt_row$cv[1]
+)
+```
+
+```{r dye-ratio-ecdf, fig.width=16, fig.height=8}
+print(plot_controls_ecdf(
+  dye_ratio_ecdf_df,
+  title_prefix = "Dye-ratio fit ECDF comparison",
+  subtitle_path = dye_ratio_optimizer_csv
+))
+
+for (condition_value in condition_levels) {
+  print(plot_condition_ecdf(
+    dye_ratio_ecdf_df,
+    condition_value,
+    title_prefix = "Dye-ratio fit ECDF comparison",
+    subtitle_path = dye_ratio_optimizer_csv
+  ))
+}
+```
