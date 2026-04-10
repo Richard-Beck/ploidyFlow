@@ -118,7 +118,8 @@ dataset_tbl <- dataset_tbl %>%
   mutate(
     cache_dir = file.path(processed_root, dataset_id),
     gs_cache_path = file.path(cache_dir, "gating_gs"),
-    figure_dir = file.path(figure_root, dataset_id)
+    figure_dir = file.path(figure_root, dataset_id),
+    dna_vector_export_path = file.path(cache_dir, "filtered_dna_area_vectors.rds")
   )
 
 dataset_tbl$flow_files <- lapply(dataset_tbl$dataset_dir, discover_flow_files)
@@ -144,6 +145,7 @@ dataset_configs <- lapply(seq_len(nrow(dataset_tbl)), function(i) {
     cache_dir = dataset_tbl$cache_dir[[i]],
     gs_cache_path = dataset_tbl$gs_cache_path[[i]],
     figure_dir = dataset_tbl$figure_dir[[i]],
+    dna_vector_export_path = dataset_tbl$dna_vector_export_path[[i]],
     flow_files = dataset_tbl$flow_files[[i]],
     plot_paths = dataset_tbl$plot_paths[[i]],
     has_cache = dataset_tbl$has_cache[[i]],
@@ -160,7 +162,6 @@ dataset_inventory <- dataset_tbl %>%
   transmute(
     dataset_name,
     dataset_id,
-    dataset_dir,
     n_files,
     has_cache,
     has_all_reusable_plots
@@ -415,12 +416,47 @@ build_or_load_dataset <- function(cfg) {
   })
   peak_table <- bind_rows(peak_table)
 
+  flow_file_map <- setNames(cfg$flow_files, tools::file_path_sans_ext(basename(cfg$flow_files)))
+  sample_keys <- tools::file_path_sans_ext(basename(sampleNames(gs)))
+  names(sample_keys) <- sampleNames(gs)
+
+  filtered_dna_area_raw <- setNames(
+    lapply(sampleNames(gs), function(sn) {
+      keep_idx <- gh_pop_get_indices(gs[[sn]], "Singlets")
+      raw_ff <- read.FCS(
+        flow_file_map[[sample_keys[[sn]]]],
+        transformation = FALSE,
+        truncate_max_range = FALSE
+      )
+      vals <- exprs(raw_ff)[keep_idx, cfg$dna_channels[1]]
+      as.numeric(vals[is.finite(vals)])
+    }),
+    sample_keys
+  )
+
+  filtered_dna_area_transformed <- setNames(
+    lapply(sampleNames(gs), function(sn) {
+      root_ff <- gh_pop_get_data(gs[[sn]], "root")
+      keep_idx <- gh_pop_get_indices(gs[[sn]], "Singlets")
+      vals <- exprs(root_ff)[keep_idx, cfg$dna_channels[1]]
+      as.numeric(vals[is.finite(vals)])
+    }),
+    sample_keys
+  )
+
+  filtered_dna_area <- list(
+    raw = filtered_dna_area_raw,
+    transformed = filtered_dna_area_transformed
+  )
+  saveRDS(filtered_dna_area, cfg$dna_vector_export_path)
+
   list(
     config = cfg,
     gs = gs,
     input_tbl = input_tbl,
     gate_counts = gate_counts,
-    peak_table = peak_table
+    peak_table = peak_table,
+    filtered_dna_area = filtered_dna_area
   )
 }
 
@@ -473,6 +509,19 @@ dataset_peak_summary <- function(peak_table) {
     median_peaks_per_sample = median(peak_counts$n_peaks),
     max_peaks_per_sample = max(peak_counts$n_peaks),
     median_peak_x = median(peak_table$peak_x, na.rm = TRUE)
+  )
+}
+
+dataset_export_summary <- function(filtered_dna_area, export_path) {
+  vector_lengths <- lengths(filtered_dna_area$raw)
+
+  tibble(
+    export_path = export_path,
+    n_samples = length(filtered_dna_area$raw),
+    min_vector_length = min(vector_lengths),
+    median_vector_length = median(vector_lengths),
+    max_vector_length = max(vector_lengths),
+    includes_transformed = "transformed" %in% names(filtered_dna_area)
   )
 }
 
@@ -622,6 +671,13 @@ for (res in dataset_results) {
   if (should_print_table(peak_summary)) {
     cat("### DNA Peak Summary\n\n")
     print(kable(peak_summary))
+    cat("\n")
+  }
+
+  export_summary <- dataset_export_summary(res$filtered_dna_area, cfg$dna_vector_export_path)
+  if (should_print_table(export_summary)) {
+    cat("### DNA-Area Export\n\n")
+    print(kable(export_summary))
     cat("\n")
   }
 
