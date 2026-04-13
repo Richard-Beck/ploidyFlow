@@ -32,7 +32,36 @@ own figure namespace under `figure/`, so additional datasets can be added
 without colliding with existing outputs.
 
 ```{r load-js, results='asis'}
-cat('<script src="https://unpkg.com/panzoom@9.4.0/dist/panzoom.min.js"></script>')
+cat('
+<script src="https://unpkg.com/panzoom@9.4.0/dist/panzoom.min.js"></script>
+<style>
+.plot-gallery {
+  margin: 1rem 0 2rem 0;
+}
+.plot-gallery-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+.plot-gallery-controls button {
+  padding: 0.3rem 0.7rem;
+}
+.plot-gallery-status {
+  font-size: 0.95rem;
+  color: #444;
+}
+.plot-slide {
+  max-width: 100%;
+}
+.plot-caption {
+  margin-top: 0.5rem;
+  font-size: 0.95rem;
+  color: #444;
+  text-align: center;
+}
+</style>
+')
 ```
 
 ```{r libraries}
@@ -54,7 +83,7 @@ processed_root <- "processed_data"
 figure_root <- "figure"
 
 reuse_existing_figures <- TRUE
-force_rebuild_figures <- FALSE
+force_rebuild_figures <- TRUE
 
 default_qc_channels <- c(
   "FSC-A", "FSC-H", "FSC-W",
@@ -63,6 +92,8 @@ default_qc_channels <- c(
 )
 default_dna_channels <- c("450-Violet C-A", "450-Violet C-H")
 default_dna_cofactor <- 500
+default_dna_fraction_threshold <- 20000
+default_raw_dna_reference_threshold <- 12000
 
 sanitize_dataset_id <- function(x) {
   x <- tolower(gsub("[^A-Za-z0-9]+", "-", x))
@@ -77,7 +108,6 @@ discover_dataset_dirs <- function(root_path) {
   dirs <- list.dirs(root_path, recursive = FALSE, full.names = TRUE)
   dirs <- dirs[!startsWith(basename(dirs), ".")]
   dirs <- dirs[basename(dirs) != "cache"]
-  dirs <- dirs[!grepl("hypoxia", basename(dirs), ignore.case = TRUE)]
   sort(normalizePath(dirs, winslash = "/", mustWork = TRUE))
 }
 
@@ -97,9 +127,33 @@ discover_flow_files <- function(dataset_dir) {
 make_plot_paths <- function(figure_dir) {
   list(
     fsc_ssc = file.path(figure_dir, "fsc-ssc-plots-1.png"),
+    fsc_time = file.path(figure_dir, "fsc-time-plots-1.png"),
     dna_scatter = file.path(figure_dir, "dna-scatter-plots-1.png"),
-    dna_density = file.path(figure_dir, "dna-density-plots-1.png")
+    dna_density = file.path(figure_dir, "dna-density-plots-1.png"),
+    dna_fraction_summary = file.path(figure_dir, "dna-fraction-summary-1.png"),
+    raw_dna_peak_locations = file.path(figure_dir, "raw-dna-peak-locations-1.png"),
+    raw_dna_peak_location_covariation = file.path(figure_dir, "raw-dna-peak-location-covariation-1.png"),
+    raw_dna_peak_width_covariation = file.path(figure_dir, "raw-dna-peak-width-covariation-1.png"),
+    raw_dna_peak_vs_fraction_above_threshold = file.path(figure_dir, "raw-dna-peak-vs-fraction-above-threshold-1.png")
   )
+}
+
+discover_time_step_seconds <- function(flow_files, dataset_name) {
+  kw <- keyword(read.FCS(
+    flow_files[[1]],
+    transformation = FALSE,
+    truncate_max_range = FALSE
+  ))
+  time_step <- suppressWarnings(as.numeric(kw[["$TIMESTEP"]]))
+
+  if (!is.finite(time_step) || time_step <= 0) {
+    stop(sprintf(
+      "Dataset '%s' is missing a valid $TIMESTEP keyword needed for FSC-A vs Time plotting.",
+      dataset_name
+    ))
+  }
+
+  time_step
 }
 
 dir.create(processed_root, recursive = TRUE, showWarnings = FALSE)
@@ -119,6 +173,8 @@ dataset_tbl <- tibble(
 dataset_tbl$qc_channels <- rep(list(default_qc_channels), nrow(dataset_tbl))
 dataset_tbl$dna_channels <- rep(list(default_dna_channels), nrow(dataset_tbl))
 dataset_tbl$dna_cofactor <- rep(default_dna_cofactor, nrow(dataset_tbl))
+dataset_tbl$dna_fraction_threshold <- rep(default_dna_fraction_threshold, nrow(dataset_tbl))
+dataset_tbl$raw_dna_reference_threshold <- rep(default_raw_dna_reference_threshold, nrow(dataset_tbl))
 
 dataset_tbl <- dataset_tbl %>%
   filter(enabled) %>%
@@ -133,6 +189,12 @@ dataset_tbl <- dataset_tbl %>%
 dataset_tbl$flow_files <- lapply(dataset_tbl$dataset_dir, discover_flow_files)
 dataset_tbl$n_files <- lengths(dataset_tbl$flow_files)
 stopifnot(all(dataset_tbl$n_files > 0))
+dataset_tbl$time_step_seconds <- mapply(
+  discover_time_step_seconds,
+  dataset_tbl$flow_files,
+  dataset_tbl$dataset_name,
+  SIMPLIFY = TRUE
+)
 
 dataset_tbl$plot_paths <- lapply(dataset_tbl$figure_dir, make_plot_paths)
 dataset_tbl$has_cache <- dir.exists(dataset_tbl$gs_cache_path)
@@ -150,6 +212,9 @@ dataset_configs <- lapply(seq_len(nrow(dataset_tbl)), function(i) {
     qc_channels = dataset_tbl$qc_channels[[i]],
     dna_channels = dataset_tbl$dna_channels[[i]],
     dna_cofactor = dataset_tbl$dna_cofactor[[i]],
+    dna_fraction_threshold = dataset_tbl$dna_fraction_threshold[[i]],
+    raw_dna_reference_threshold = dataset_tbl$raw_dna_reference_threshold[[i]],
+    time_step_seconds = dataset_tbl$time_step_seconds[[i]],
     cache_dir = dataset_tbl$cache_dir[[i]],
     gs_cache_path = dataset_tbl$gs_cache_path[[i]],
     figure_dir = dataset_tbl$figure_dir[[i]],
@@ -539,7 +604,7 @@ dataset_export_summary <- function(filtered_dna_area, dna_vector_export_path, me
   )
 }
 
-render_or_include_plot <- function(plot_path, plot_builder, width, height, element_id, dpi = 300) {
+ensure_plot_file <- function(plot_path, plot_builder, width, height, dpi = 300) {
   should_rebuild <- force_rebuild_figures || !reuse_existing_figures || !file.exists(plot_path)
 
   if (should_rebuild) {
@@ -554,6 +619,10 @@ render_or_include_plot <- function(plot_path, plot_builder, width, height, eleme
       limitsize = FALSE
     )
   }
+}
+
+render_or_include_plot <- function(plot_path, plot_builder, width, height, element_id, dpi = 300) {
+  ensure_plot_file(plot_path, plot_builder, width, height, dpi)
 
   plot_src <- file.path("..", plot_path)
   plot_src <- gsub("\\\\", "/", plot_src)
@@ -561,6 +630,53 @@ render_or_include_plot <- function(plot_path, plot_builder, width, height, eleme
     '<img src="%s" id="%s" class="zoomable-plot" style="width:100%%;" />',
     plot_src,
     element_id
+  )
+}
+
+render_plot_gallery <- function(plot_paths, plot_builders, width, height, element_id, captions = NULL, dpi = 300) {
+  stopifnot(length(plot_paths) == length(plot_builders))
+  if (is.null(captions)) {
+    captions <- rep("", length(plot_paths))
+  }
+  stopifnot(length(captions) == length(plot_paths))
+
+  for (i in seq_along(plot_paths)) {
+    ensure_plot_file(plot_paths[[i]], plot_builders[[i]], width, height, dpi)
+  }
+
+  slides_html <- vapply(seq_along(plot_paths), function(i) {
+    plot_src <- file.path("..", plot_paths[[i]])
+    plot_src <- gsub("\\\\", "/", plot_src)
+    slide_display <- if (i == 1) "block" else "none"
+    sprintf(
+      paste0(
+        '<div class="plot-slide" data-index="%d" style="display:%s;">',
+        '<img src="%s" class="zoomable-plot gallery-img" style="width:100%%;" />',
+        '<div class="plot-caption">%s</div>',
+        '</div>'
+      ),
+      i - 1,
+      slide_display,
+      plot_src,
+      captions[[i]]
+    )
+  }, character(1))
+
+  sprintf(
+    paste0(
+      '<div class="plot-gallery" id="%s">',
+      '<div class="plot-gallery-controls">',
+      "<button type=\"button\" onclick=\"plotGalleryPrev('%s')\">Prev</button>",
+      "<button type=\"button\" onclick=\"plotGalleryNext('%s')\">Next</button>",
+      '<span class="plot-gallery-status"></span>',
+      '</div>',
+      '%s',
+      '</div>'
+    ),
+    element_id,
+    element_id,
+    element_id,
+    paste(slides_html, collapse = "")
   )
 }
 
@@ -580,6 +696,107 @@ build_fsc_ssc_plot <- function(gs) {
   as.ggplot(p_fsc_raw) + as.ggplot(p_fsc_filtered)
 }
 
+build_fsc_time_plot <- function(gs, time_step_seconds, dna_channel, smooth_window = 5) {
+  p_fsc_time_raw <- ggcyto(gs, subset = "root", aes(x = Time, y = `FSC-A`)) +
+    geom_hex(bins = 60) +
+    facet_wrap(~ name, scales = "free_x") +
+    labs(title = "FSC-A vs Time", x = "Time (s)", y = "FSC-A") +
+    scale_x_continuous(labels = function(x) scales::label_number()(x * time_step_seconds)) +
+    theme_bw() +
+    theme(strip.text = element_text(size = 8))
+
+  root_data <- gs_pop_get_data(gs, "root")
+  time_summary_df <- bind_rows(lapply(sampleNames(root_data), function(sn) {
+    ff <- root_data[[sn]]
+    expr <- exprs(ff)
+    time_values <- expr[, "Time"]
+    dna_values <- expr[, dna_channel]
+    time_seconds <- time_values * time_step_seconds
+    keep <- is.finite(time_seconds) & is.finite(dna_values)
+    time_seconds <- time_seconds[keep]
+    dna_values <- dna_values[keep]
+
+    if (length(time_seconds) == 0) {
+      return(tibble(
+        name = sn,
+        time_bin_start = numeric(0),
+        event_rate_hz = numeric(0),
+        dna_mean = numeric(0),
+        dna_sd = numeric(0)
+      ))
+    }
+
+    tibble(
+      name = sn,
+      time_bin_start = floor(time_seconds),
+      dna_value = dna_values
+    ) %>%
+      group_by(name, time_bin_start) %>%
+      summarise(
+        event_rate_hz = dplyr::n(),
+        dna_mean = mean(dna_value, na.rm = TRUE),
+        dna_sd = sd(dna_value, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      arrange(time_bin_start) %>%
+      mutate(
+        dna_mean_smooth = as.numeric(stats::filter(
+          dna_mean,
+          rep(1 / smooth_window, smooth_window),
+          sides = 2
+        )),
+        dna_sd_smooth = as.numeric(stats::filter(
+          dna_sd,
+          rep(1 / smooth_window, smooth_window),
+          sides = 2
+        ))
+      ) %>%
+      mutate(
+        dna_mean_smooth = ifelse(is.na(dna_mean_smooth), dna_mean, dna_mean_smooth),
+        dna_sd_smooth = ifelse(is.na(dna_sd_smooth), dna_sd, dna_sd_smooth)
+      )
+  }))
+
+  rate_max <- max(time_summary_df$event_rate_hz, na.rm = TRUE)
+  dna_upper_max <- max(time_summary_df$dna_mean_smooth + time_summary_df$dna_sd_smooth, na.rm = TRUE)
+  dna_scale_factor <- if (is.finite(rate_max) && is.finite(dna_upper_max) && dna_upper_max > 0) {
+    rate_max / dna_upper_max
+  } else {
+    1
+  }
+
+  p_event_rate <- ggplot(time_summary_df, aes(x = time_bin_start, y = event_rate_hz)) +
+    geom_line(linewidth = 0.3) +
+    geom_ribbon(
+      aes(
+        x = time_bin_start,
+        ymin = pmax((dna_mean_smooth - dna_sd_smooth) * dna_scale_factor, 0),
+        ymax = pmax((dna_mean_smooth + dna_sd_smooth) * dna_scale_factor, 0)
+      ),
+      inherit.aes = FALSE,
+      fill = "#4C78A8",
+      alpha = 0.15
+    ) +
+    geom_line(
+      aes(y = dna_mean_smooth * dna_scale_factor),
+      color = "#4C78A8",
+      linewidth = 0.4
+    ) +
+    facet_wrap(~ name, scales = "free") +
+    labs(
+      title = sprintf("Event Rate and %s vs Time", dna_channel),
+      x = "Time (s)",
+      y = "Events/s"
+    ) +
+    scale_y_continuous(
+      sec.axis = sec_axis(~ . / dna_scale_factor, name = sprintf("%s Mean +/- SD", dna_channel))
+    ) +
+    theme_bw() +
+    theme(strip.text = element_text(size = 8))
+
+  as.ggplot(p_fsc_time_raw) + p_event_rate
+}
+
 build_dna_scatter_plot <- function(gs, dna_channels) {
   p_dna_raw <- ggcyto(gs, subset = "root", aes(x = .data[[dna_channels[1]]], y = .data[[dna_channels[2]]])) +
     geom_hex(bins = 60) +
@@ -596,20 +813,399 @@ build_dna_scatter_plot <- function(gs, dna_channels) {
   as.ggplot(p_dna_raw) + as.ggplot(p_dna_filtered)
 }
 
-build_dna_density_plot <- function(gs, dna_channels) {
+build_dna_density_plot <- function(gs, dna_channels, dna_threshold, dna_cofactor) {
+  threshold_transformed <- asinh(dna_threshold / dna_cofactor)
+
   p_density_raw <- ggcyto(gs, subset = "root", aes(x = .data[[dna_channels[1]]])) +
     geom_density(fill = "gray50", alpha = 0.5, linewidth = 0.5) +
+    geom_vline(xintercept = threshold_transformed, color = "red3", linetype = "dashed", linewidth = 0.7) +
     labs(title = "DNA Density (Raw)", y = "Density") +
     theme_bw() +
     theme(strip.text = element_text(size = 8))
 
   p_density_filtered <- ggcyto(gs, subset = "Singlets", aes(x = .data[[dna_channels[1]]])) +
     geom_density(fill = "gray50", alpha = 0.5, linewidth = 0.5) +
+    geom_vline(xintercept = threshold_transformed, color = "red3", linetype = "dashed", linewidth = 0.7) +
     labs(title = "DNA Density (Filtered Singlets)", y = "Density") +
     theme_bw() +
     theme(strip.text = element_text(size = 8))
 
   as.ggplot(p_density_raw) + as.ggplot(p_density_filtered)
+}
+
+build_dna_fraction_summary_plot <- function(gs, filtered_dna_area, sample_metadata, dna_threshold) {
+  total_event_df <- tibble(
+    sample_name = basename(sampleNames(gs)),
+    total_events = vapply(sampleNames(gs), function(sn) {
+      nrow(exprs(gh_pop_get_data(gs[[sn]], "root")))
+    }, numeric(1))
+  ) %>%
+    mutate(sample_id = tools::file_path_sans_ext(sample_name))
+
+  fraction_df <- tibble(
+    sample_id = names(filtered_dna_area$raw),
+    singlet_events = lengths(filtered_dna_area$raw),
+    fraction_above_threshold = vapply(filtered_dna_area$raw, function(x) {
+      x <- x[is.finite(x)]
+      if (length(x) == 0) return(NA_real_)
+      mean(x > dna_threshold)
+    }, numeric(1))
+  )
+
+  plot_df <- total_event_df %>%
+    left_join(fraction_df, by = "sample_id") %>%
+    left_join(select(sample_metadata, sample_id, cell_line, condition), by = "sample_id")
+
+  ggplot(
+    plot_df,
+    aes(x = total_events, y = fraction_above_threshold, color = condition, shape = cell_line)
+  ) +
+    geom_point(size = 2.2, alpha = 0.9, na.rm = TRUE) +
+    scale_x_continuous(labels = scales::label_comma()) +
+    scale_y_continuous(labels = scales::label_percent(accuracy = 1)) +
+    labs(
+      title = sprintf("DNA-A > %s Fraction vs Total Events", scales::comma(dna_threshold)),
+      x = "Total Events",
+      y = "Fraction of DNA Singlets Above Threshold",
+      color = "Condition",
+      shape = "Cell Line"
+    ) +
+    theme_bw()
+}
+
+raw_dna_plot_palette <- function(group_values) {
+  base_palette <- c(
+    "Controls" = "#1b9e77",
+    "A1" = "#7570b3",
+    "AOA" = "#e7298a",
+    "AN" = "#66a61e",
+    "H1" = "#e6ab02",
+    "HN" = "#a6761d",
+    "HOH" = "#1f78b4",
+    "N1" = "#b2df8a",
+    "Unannotated" = "#666666"
+  )
+
+  missing_groups <- setdiff(group_values, names(base_palette))
+  if (length(missing_groups) > 0) {
+    extra_cols <- grDevices::hcl.colors(length(missing_groups), palette = "Dark 3")
+    names(extra_cols) <- missing_groups
+    base_palette <- c(base_palette, extra_cols)
+  }
+
+  base_palette[group_values]
+}
+
+build_raw_dna_plot_df <- function(filtered_dna_area, sample_metadata, max_signal = Inf) {
+  sample_tbl <- tibble(sample_id = names(filtered_dna_area$raw)) %>%
+    left_join(select(sample_metadata, sample_id, cell_line, condition), by = "sample_id") %>%
+    mutate(
+      condition_plot = ifelse(is.na(condition), "Unannotated", condition),
+      is_control = condition_plot %in% c("2N_Control", "4N_Control") | sample_id == "Sample_CEN",
+      overlay_group = ifelse(is_control, "Controls", condition_plot),
+      sample_label = sample_id
+    )
+
+  plot_df <- bind_rows(lapply(names(filtered_dna_area$raw), function(sample_id) {
+    values <- filtered_dna_area$raw[[sample_id]]
+    values <- values[is.finite(values) & values < max_signal]
+    if (length(values) == 0) {
+      return(NULL)
+    }
+
+    tibble(
+      sample_id = sample_id,
+      raw_dna_a = values
+    )
+  }))
+
+  if (nrow(plot_df) == 0) {
+    stop(sprintf("No raw DNA-A values remained after filtering below %s.", scales::comma(max_signal)))
+  }
+
+  plot_df %>%
+    left_join(sample_tbl, by = "sample_id")
+}
+
+build_raw_dna_plot_context <- function(filtered_dna_area, sample_metadata) {
+  raw_all_df <- build_raw_dna_plot_df(filtered_dna_area, sample_metadata, max_signal = Inf)
+  finite_values <- raw_all_df$raw_dna_a[is.finite(raw_all_df$raw_dna_a)]
+  if (length(finite_values) == 0) {
+    stop("No finite raw DNA-A values were available.")
+  }
+
+  unique_values <- sort(unique(finite_values))
+  if (length(unique_values) < 2) {
+    stop("Could not derive a raw DNA-A bin width from the filtered singlet vectors.")
+  }
+
+  diffs <- diff(unique_values)
+  diffs <- diffs[is.finite(diffs) & diffs > 0]
+  if (length(diffs) == 0) {
+    stop("Could not derive a positive raw DNA-A bin width from the filtered singlet vectors.")
+  }
+
+  group_values <- unique(c("Controls", sort(unique(raw_all_df$overlay_group[!raw_all_df$is_control])), "Unannotated"))
+
+  list(
+    raw_all_df = raw_all_df,
+    bin_width = min(diffs),
+    color_values = raw_dna_plot_palette(group_values)
+  )
+}
+
+interpolate_half_height_crossing <- function(x_left, y_left, x_right, y_right, target_y) {
+  if (!is.finite(x_left) || !is.finite(y_left) || !is.finite(x_right) || !is.finite(y_right)) {
+    return(NA_real_)
+  }
+  if (y_left == y_right) {
+    return(mean(c(x_left, x_right)))
+  }
+  x_left + (target_y - y_left) * (x_right - x_left) / (y_right - y_left)
+}
+
+summarise_threshold_peak <- function(values, side = c("below", "above"), threshold = 12000, density_n = 1024) {
+  side <- match.arg(side)
+  values <- values[is.finite(values)]
+  values <- if (side == "below") values[values < threshold] else values[values > threshold]
+
+  if (length(values) < 10 || length(unique(values)) < 2) {
+    return(tibble(
+      peak_location = NA_real_,
+      peak_height = NA_real_,
+      half_height_left = NA_real_,
+      half_height_right = NA_real_,
+      peak_width_fwhm = NA_real_,
+      peak_n = length(values)
+    ))
+  }
+
+  density_obj <- density(values, n = density_n, from = min(values), to = max(values), na.rm = TRUE)
+  x <- density_obj$x
+  y <- density_obj$y
+  if (length(x) < 3 || all(!is.finite(y))) {
+    return(tibble(
+      peak_location = NA_real_,
+      peak_height = NA_real_,
+      half_height_left = NA_real_,
+      half_height_right = NA_real_,
+      peak_width_fwhm = NA_real_,
+      peak_n = length(values)
+    ))
+  }
+
+  local_max_idx <- which(y >= dplyr::lag(y, default = -Inf) & y >= dplyr::lead(y, default = -Inf))
+  if (length(local_max_idx) == 0) {
+    local_max_idx <- which.max(y)
+  }
+  peak_idx <- local_max_idx[which.max(y[local_max_idx])]
+  peak_x <- x[peak_idx]
+  peak_y <- y[peak_idx]
+  half_height <- peak_y / 2
+
+  left_idx <- which(y[seq_len(peak_idx)] < half_height)
+  if (length(left_idx) == 0) {
+    left_cross <- x[1]
+  } else {
+    left_low_idx <- max(left_idx)
+    left_high_idx <- min(left_low_idx + 1, peak_idx)
+    left_cross <- interpolate_half_height_crossing(
+      x[left_low_idx], y[left_low_idx],
+      x[left_high_idx], y[left_high_idx],
+      half_height
+    )
+  }
+
+  right_range <- peak_idx:length(y)
+  right_idx_rel <- which(y[right_range] < half_height)
+  if (length(right_idx_rel) == 0) {
+    right_cross <- x[length(x)]
+  } else {
+    right_low_idx <- right_range[min(right_idx_rel)] - 1
+    right_low_idx <- max(right_low_idx, peak_idx)
+    right_high_idx <- min(right_low_idx + 1, length(x))
+    right_cross <- interpolate_half_height_crossing(
+      x[right_low_idx], y[right_low_idx],
+      x[right_high_idx], y[right_high_idx],
+      half_height
+    )
+  }
+
+  tibble(
+    peak_location = peak_x,
+    peak_height = peak_y,
+    half_height_left = left_cross,
+    half_height_right = right_cross,
+    peak_width_fwhm = right_cross - left_cross,
+    peak_n = length(values)
+  )
+}
+
+build_threshold_peak_summary_df <- function(raw_all_df, threshold = 12000) {
+  non_control_df <- raw_all_df %>% filter(!is_control)
+  if (nrow(non_control_df) == 0) {
+    stop("No non-control samples available for threshold peak summaries.")
+  }
+
+  split_values <- split(non_control_df$raw_dna_a, non_control_df$sample_label)
+  sample_meta <- non_control_df %>%
+    distinct(sample_label, overlay_group) %>%
+    arrange(overlay_group, sample_label)
+
+  summary_df <- bind_rows(lapply(names(split_values), function(sample_label) {
+    values <- split_values[[sample_label]]
+    below_tbl <- summarise_threshold_peak(values, side = "below", threshold = threshold)
+    above_tbl <- summarise_threshold_peak(values, side = "above", threshold = threshold)
+    tibble(
+      sample_label = sample_label,
+      below_peak_location = below_tbl$peak_location,
+      below_peak_height = below_tbl$peak_height,
+      below_half_height_left = below_tbl$half_height_left,
+      below_half_height_right = below_tbl$half_height_right,
+      below_peak_width_fwhm = below_tbl$peak_width_fwhm,
+      below_peak_n = below_tbl$peak_n,
+      above_peak_location = above_tbl$peak_location,
+      above_peak_height = above_tbl$peak_height,
+      above_half_height_left = above_tbl$half_height_left,
+      above_half_height_right = above_tbl$half_height_right,
+      above_peak_width_fwhm = above_tbl$peak_width_fwhm,
+      above_peak_n = above_tbl$peak_n,
+      fraction_above_threshold = mean(values > threshold)
+    )
+  })) %>%
+    left_join(sample_meta, by = "sample_label")
+
+  summary_df %>%
+    mutate(sample_label = factor(sample_label, levels = sample_meta$sample_label))
+}
+
+plot_threshold_peak_locations <- function(peak_summary_df, color_values, threshold = 12000) {
+  plot_df <- bind_rows(
+    peak_summary_df %>%
+      transmute(
+        sample_label,
+        overlay_group,
+        side = sprintf("Below %s", scales::comma(threshold)),
+        peak_location = below_peak_location,
+        whisker_left = below_half_height_left,
+        whisker_right = below_half_height_right
+      ),
+    peak_summary_df %>%
+      transmute(
+        sample_label,
+        overlay_group,
+        side = sprintf("Above %s", scales::comma(threshold)),
+        peak_location = above_peak_location,
+        whisker_left = above_half_height_left,
+        whisker_right = above_half_height_right
+      )
+  )
+
+  ggplot(plot_df, aes(x = peak_location, y = sample_label, color = overlay_group, shape = side)) +
+    geom_segment(
+      aes(x = whisker_left, xend = whisker_right, y = sample_label, yend = sample_label),
+      linewidth = 0.8,
+      alpha = 0.85,
+      na.rm = TRUE
+    ) +
+    geom_point(size = 2.6, na.rm = TRUE) +
+    scale_color_manual(values = color_values, drop = FALSE) +
+    labs(
+      title = "Dominant peak locations above and below threshold",
+      subtitle = sprintf("Controls excluded. Points mark the highest smoothed-density peak on each side of %s; whiskers show the corresponding FWHM.", scales::comma(threshold)),
+      x = "Peak location",
+      y = NULL,
+      color = "Overlay group",
+      shape = "Peak side"
+    ) +
+    theme_bw(base_size = 13.5) +
+    theme(
+      axis.text.y = element_text(size = 9.5),
+      panel.grid.minor = element_blank()
+    )
+}
+
+plot_threshold_peak_location_covariation <- function(peak_summary_df, color_values, threshold = 12000) {
+  line_fit <- lm(above_peak_location ~ below_peak_location, data = peak_summary_df)
+  line_summary <- summary(line_fit)
+  fit_grid <- tibble(
+    below_peak_location = seq(
+      min(peak_summary_df$below_peak_location, na.rm = TRUE),
+      max(peak_summary_df$below_peak_location, na.rm = TRUE),
+      length.out = 200
+    )
+  )
+  fit_grid$above_peak_location <- predict(line_fit, newdata = fit_grid)
+
+  annotation_df <- tibble(
+    below_peak_location = min(peak_summary_df$below_peak_location, na.rm = TRUE) + 0.05 * diff(range(peak_summary_df$below_peak_location, na.rm = TRUE)),
+    above_peak_location = max(peak_summary_df$above_peak_location, na.rm = TRUE) - 0.05 * diff(range(peak_summary_df$above_peak_location, na.rm = TRUE)),
+    label = sprintf(
+      "line slope = %.4f\nline R^2 = %.4f",
+      unname(coef(line_fit)[["below_peak_location"]]),
+      line_summary$r.squared
+    )
+  )
+
+  ggplot(peak_summary_df, aes(x = below_peak_location, y = above_peak_location, color = overlay_group)) +
+    geom_point(size = 2.8, na.rm = TRUE) +
+    geom_line(
+      data = fit_grid,
+      inherit.aes = FALSE,
+      aes(x = below_peak_location, y = above_peak_location),
+      color = "black",
+      linewidth = 0.8
+    ) +
+    geom_label(
+      data = annotation_df,
+      inherit.aes = FALSE,
+      aes(x = below_peak_location, y = above_peak_location, label = label),
+      hjust = 0,
+      vjust = 1,
+      size = 3.5,
+      label.size = 0.25
+    ) +
+    scale_color_manual(values = color_values, drop = FALSE) +
+    labs(
+      title = "Above-threshold peak location vs below-threshold peak location",
+      subtitle = sprintf("Controls excluded. Both axes come from the highest smoothed-density peak on each side of %s.", scales::comma(threshold)),
+      x = "Below-threshold peak location",
+      y = "Above-threshold peak location",
+      color = "Overlay group"
+    ) +
+    theme_bw(base_size = 13.5) +
+    theme(panel.grid.minor = element_blank())
+}
+
+plot_threshold_peak_width_covariation <- function(peak_summary_df, color_values, threshold = 12000) {
+  ggplot(peak_summary_df, aes(x = below_peak_width_fwhm, y = above_peak_width_fwhm, color = overlay_group)) +
+    geom_point(size = 2.8, na.rm = TRUE) +
+    scale_color_manual(values = color_values, drop = FALSE) +
+    labs(
+      title = "Above-threshold peak width vs below-threshold peak width",
+      subtitle = sprintf("Controls excluded. Width is FWHM of the highest smoothed-density peak on each side of %s.", scales::comma(threshold)),
+      x = "Below-threshold peak width (FWHM)",
+      y = "Above-threshold peak width (FWHM)",
+      color = "Overlay group"
+    ) +
+    theme_bw(base_size = 13.5) +
+    theme(panel.grid.minor = element_blank())
+}
+
+plot_threshold_peak_vs_fraction_above_threshold <- function(peak_summary_df, color_values, threshold = 12000) {
+  ggplot(peak_summary_df, aes(x = above_peak_location, y = fraction_above_threshold, color = overlay_group)) +
+    geom_point(size = 2.8, na.rm = TRUE) +
+    scale_color_manual(values = color_values, drop = FALSE) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(
+      title = "Fraction of cells above threshold vs above-threshold peak location",
+      subtitle = sprintf("Controls excluded. Peak location is the highest smoothed-density maximum above %s.", scales::comma(threshold)),
+      x = "Above-threshold peak location",
+      y = "Fraction of cells above threshold",
+      color = "Overlay group"
+    ) +
+    theme_bw(base_size = 13.5) +
+    theme(panel.grid.minor = element_blank())
 }
 ```
 
@@ -649,110 +1245,200 @@ if (should_print_table(dataset_metadata_overview)) {
 }
 ```
 
-# Dataset Details
+# Figure Galleries
 
 ```{r dataset-sections, results='asis'}
-for (res in dataset_results) {
+dataset_detail_tbl <- bind_rows(lapply(dataset_results, function(res) {
   cfg <- res$config
-  gs <- res$gs
-
-  cat(sprintf("## %s\n\n", cfg$dataset_name))
-  cat(sprintf("- Dataset id: `%s`\n", cfg$dataset_id))
-  cat(sprintf("- Source directory: `%s`\n", cfg$dataset_dir))
-  cat(sprintf("- Cache path: `%s`\n", cfg$gs_cache_path))
-  cat(sprintf("- Figure directory: `%s`\n\n", cfg$figure_dir))
-
-  cat("### Input Summary\n\n")
-  print(kable(dataset_input_summary(res$input_tbl)))
-  cat("\n")
-
-  metadata_summary <- dataset_metadata_summary(res$input_tbl)
-  if (should_print_table(metadata_summary)) {
-    cat("### Metadata Summary\n\n")
-    print(kable(metadata_summary))
-    cat("\n")
-  }
-
-  gate_summary <- dataset_gate_summary(res$gate_counts)
-  if (should_print_table(gate_summary)) {
-    cat("### Gate Count Summary\n\n")
-    print(kable(gate_summary))
-    cat("\n")
-  }
-
-  export_summary <- dataset_export_summary(
-    res$filtered_dna_area,
-    cfg$dna_vector_export_path,
-    cfg$sample_metadata_export_path
+  tibble(
+    dataset_name = cfg$dataset_name,
+    dataset_id = cfg$dataset_id,
+    source_directory = cfg$dataset_dir,
+    cache_path = cfg$gs_cache_path,
+    figure_directory = cfg$figure_dir
   )
-  if (should_print_table(export_summary)) {
-    cat("### DNA-Area Export\n\n")
-    print(kable(export_summary))
-    cat("\n")
-  }
+}))
 
-  if (should_print_table(res$input_tbl)) {
-    cat("### Input Detail\n\n")
-    print(kable(res$input_tbl))
-    cat("\n")
-  }
-
-  if (should_print_table(res$gate_counts)) {
-    cat("### Gate Count Detail\n\n")
-    print(kable(res$gate_counts))
-    cat("\n")
-  }
-
-  cat("### FSC vs SSC\n\n")
-  cat(
-    render_or_include_plot(
-      plot_path = cfg$plot_paths$fsc_ssc,
-      width = 21,
-      height = 14,
-      dpi = 300,
-      element_id = sprintf("%s-fsc-ssc-plot", cfg$dataset_id),
-      plot_builder = function() build_fsc_ssc_plot(gs)
-    )
-  )
-  cat("\n\n")
-
-  cat("### DNA Scatter\n\n")
-  cat(
-    render_or_include_plot(
-      plot_path = cfg$plot_paths$dna_scatter,
-      width = 21,
-      height = 14,
-      dpi = 300,
-      element_id = sprintf("%s-dna-scatter-plot", cfg$dataset_id),
-      plot_builder = function() build_dna_scatter_plot(gs, cfg$dna_channels)
-    )
-  )
-  cat("\n\n")
-
-  cat("### DNA Density\n\n")
-  cat(
-    render_or_include_plot(
-      plot_path = cfg$plot_paths$dna_density,
-      width = 21,
-      height = 14,
-      dpi = 300,
-      element_id = sprintf("%s-dna-density-plot", cfg$dataset_id),
-      plot_builder = function() build_dna_density_plot(gs, cfg$dna_channels)
-    )
-  )
+if (should_print_table(dataset_detail_tbl, max_rows = 12, max_cols = 5)) {
+  kable(dataset_detail_tbl)
   cat("\n\n")
 }
+
+dataset_plot_specs <- lapply(dataset_results, function(res) {
+  local({
+    cfg <- res$config
+    gs <- res$gs
+    filtered_dna_area <- res$filtered_dna_area
+    sample_metadata <- res$sample_metadata
+    raw_dna_plot_context <- build_raw_dna_plot_context(filtered_dna_area, sample_metadata)
+    raw_dna_peak_summary_df <- build_threshold_peak_summary_df(
+      raw_all_df = raw_dna_plot_context$raw_all_df,
+      threshold = cfg$raw_dna_reference_threshold
+    )
+
+    list(
+      dataset_name = cfg$dataset_name,
+      dataset_id = cfg$dataset_id,
+      plot_paths = cfg$plot_paths,
+      builders = list(
+        fsc_ssc = function() build_fsc_ssc_plot(gs),
+        fsc_time = function() build_fsc_time_plot(gs, cfg$time_step_seconds, cfg$dna_channels[1]),
+        dna_scatter = function() build_dna_scatter_plot(gs, cfg$dna_channels),
+        dna_density = function() build_dna_density_plot(
+          gs,
+          cfg$dna_channels,
+          cfg$raw_dna_reference_threshold,
+          cfg$dna_cofactor
+        ),
+        dna_fraction_summary = function() build_dna_fraction_summary_plot(
+          gs,
+          filtered_dna_area,
+          sample_metadata,
+          cfg$dna_fraction_threshold
+        ),
+        raw_dna_peak_locations = function() plot_threshold_peak_locations(
+          peak_summary_df = raw_dna_peak_summary_df,
+          color_values = raw_dna_plot_context$color_values,
+          threshold = cfg$raw_dna_reference_threshold
+        ),
+        raw_dna_peak_location_covariation = function() plot_threshold_peak_location_covariation(
+          peak_summary_df = raw_dna_peak_summary_df,
+          color_values = raw_dna_plot_context$color_values,
+          threshold = cfg$raw_dna_reference_threshold
+        ),
+        raw_dna_peak_width_covariation = function() plot_threshold_peak_width_covariation(
+          peak_summary_df = raw_dna_peak_summary_df,
+          color_values = raw_dna_plot_context$color_values,
+          threshold = cfg$raw_dna_reference_threshold
+        ),
+        raw_dna_peak_vs_fraction_above_threshold = function() plot_threshold_peak_vs_fraction_above_threshold(
+          peak_summary_df = raw_dna_peak_summary_df,
+          color_values = raw_dna_plot_context$color_values,
+          threshold = cfg$raw_dna_reference_threshold
+        )
+      )
+    )
+  })
+})
+
+render_dataset_gallery <- function(plot_key, width, height, element_id) {
+  plot_paths <- vapply(dataset_plot_specs, function(spec) spec$plot_paths[[plot_key]], character(1))
+  plot_builders <- lapply(dataset_plot_specs, function(spec) spec$builders[[plot_key]])
+  captions <- vapply(
+    dataset_plot_specs,
+    function(spec) sprintf("%s (%s)", spec$dataset_name, spec$dataset_id),
+    character(1)
+  )
+
+  cat(render_plot_gallery(
+    plot_paths = plot_paths,
+    plot_builders = plot_builders,
+    width = width,
+    height = height,
+    element_id = element_id,
+    captions = captions,
+    dpi = 300
+  ))
+  cat("\n\n")
+}
+
+cat("## FSC vs SSC\n\n")
+render_dataset_gallery("fsc_ssc", width = 21, height = 14, element_id = "gallery-fsc-ssc")
+
+cat("## FSC-A vs Time\n\n")
+render_dataset_gallery("fsc_time", width = 21, height = 7, element_id = "gallery-fsc-time")
+
+cat("## DNA Scatter\n\n")
+render_dataset_gallery("dna_scatter", width = 21, height = 14, element_id = "gallery-dna-scatter")
+
+cat("## DNA Density\n\n")
+render_dataset_gallery("dna_density", width = 21, height = 14, element_id = "gallery-dna-density")
+
+cat("## DNA Threshold Fraction Summary\n\n")
+render_dataset_gallery("dna_fraction_summary", width = 10, height = 7, element_id = "gallery-dna-fraction-summary")
+
+cat("## Raw DNA-A Peak Locations\n\n")
+render_dataset_gallery("raw_dna_peak_locations", width = 12, height = 8, element_id = "gallery-raw-dna-peak-locations")
+
+cat("## Raw DNA-A Peak Location Covariation\n\n")
+render_dataset_gallery("raw_dna_peak_location_covariation", width = 12, height = 8, element_id = "gallery-raw-dna-peak-location-covariation")
+
+cat("## Raw DNA-A Peak Width Covariation\n\n")
+render_dataset_gallery("raw_dna_peak_width_covariation", width = 12, height = 8, element_id = "gallery-raw-dna-peak-width-covariation")
+
+cat("## Raw DNA-A Tail Fraction vs Above-Threshold Peak\n\n")
+render_dataset_gallery("raw_dna_peak_vs_fraction_above_threshold", width = 12, height = 8, element_id = "gallery-raw-dna-peak-vs-fraction")
 ```
 
 ```{r activate-zoom, results='asis'}
 cat('
 <script>
-(function() {
-  Array.prototype.forEach.call(document.querySelectorAll(".zoomable-plot"), function(el) {
-    if (!el || typeof panzoom === "undefined") return;
-    panzoom(el, { maxZoom: 10, minZoom: 1 });
+window.plotGalleryState = window.plotGalleryState || {};
+
+function initPlotGallery(id) {
+  var gallery = document.getElementById(id);
+  if (!gallery) return;
+
+  var slides = gallery.querySelectorAll(".plot-slide");
+  var statusEl = gallery.querySelector(".plot-gallery-status");
+  if (!slides.length) return;
+
+  window.plotGalleryState[id] = {
+    i: 0,
+    n: slides.length,
+    panzoomInit: {}
+  };
+
+  updatePlotGallery(id);
+}
+
+function updatePlotGallery(id) {
+  var gallery = document.getElementById(id);
+  var state = window.plotGalleryState[id];
+  if (!gallery || !state) return;
+
+  var slides = gallery.querySelectorAll(".plot-slide");
+  var statusEl = gallery.querySelector(".plot-gallery-status");
+
+  Array.prototype.forEach.call(slides, function(slide, idx) {
+    slide.style.display = idx === state.i ? "block" : "none";
   });
-})();
+
+  if (statusEl) {
+    statusEl.textContent = (state.i + 1) + " / " + state.n;
+  }
+
+  var activeSlide = slides[state.i];
+  if (!activeSlide) return;
+
+  var img = activeSlide.querySelector("img.zoomable-plot");
+  if (!img || typeof panzoom === "undefined") return;
+
+  if (!state.panzoomInit[state.i]) {
+    panzoom(img, { maxZoom: 10, minZoom: 1 });
+    state.panzoomInit[state.i] = true;
+  }
+}
+
+function plotGalleryNext(id) {
+  var state = window.plotGalleryState[id];
+  if (!state) return;
+  state.i = (state.i + 1) % state.n;
+  updatePlotGallery(id);
+}
+
+function plotGalleryPrev(id) {
+  var state = window.plotGalleryState[id];
+  if (!state) return;
+  state.i = (state.i - 1 + state.n) % state.n;
+  updatePlotGallery(id);
+}
+
+document.addEventListener("DOMContentLoaded", function() {
+  document.querySelectorAll(".plot-gallery").forEach(function(el) {
+    initPlotGallery(el.id);
+  });
+});
 </script>
 ')
 ```

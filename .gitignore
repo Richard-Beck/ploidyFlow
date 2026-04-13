@@ -6,3 +6,4 @@ figure
 workflow/cache/
 workflow/workflow/
 workflow/tmp_*.md
+tmp/

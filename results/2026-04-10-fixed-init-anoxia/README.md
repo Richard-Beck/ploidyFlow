@@ -23,7 +23,7 @@ The plots, RDS manifest, compiled CmdStan executable, gating cache, and full
 2. Gated DNA-area export at `processed_data/anoxia-flowcytometry/filtered_dna_area_vectors.rds`
 3. Stan data bundle at `processed_data/stan_data.Rds`
 4. Stan model at `stan/ploidy_histogram_first_pass.stan`
-5. Driver script at `R/fixed_init_optimize_and_plot.R`
+5. Driver script at `R/run_fit.R first_pass`
 6. Optimizer output at `processed_data/stan_optimize_fixed_init_anoxia/fixed_init_optimize-1.csv`
 
 Run settings:

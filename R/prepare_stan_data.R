@@ -10,6 +10,20 @@ output_path <- file.path(processed_root, "stan_data.Rds")
 n_bins <- 512L
 n_s_phase <- 5L
 
+derive_sample_group <- function(sample_name) {
+  sample_id <- tools::file_path_sans_ext(basename(sample_name))
+
+  if (identical(sample_id, "Sample_CEN")) {
+    return("CEN")
+  }
+
+  if (grepl("^Sample_SUM159_", sample_id)) {
+    return(sub("^Sample_SUM159_([0-9]+_)?", "", sample_id))
+  }
+
+  sample_id
+}
+
 find_export_files <- function(root_dir) {
   files <- list.files(
     root_dir,
@@ -120,6 +134,14 @@ for (i in seq_along(export_files)) {
 }
 
 sample_lut <- do.call(rbind, sample_lut_parts)
+sample_lut$sample_group <- vapply(sample_lut$sample_name, derive_sample_group, character(1))
+group_levels <- unique(sample_lut$sample_group)
+group_lut <- data.frame(
+  group_id = seq_along(group_levels),
+  group_name = group_levels,
+  stringsAsFactors = FALSE
+)
+sample_lut$group_id <- match(sample_lut$sample_group, group_lut$group_name)
 all_samples <- unlist(sample_parts, recursive = FALSE)
 combined <- do.call(rbind, all_samples)
 
@@ -162,18 +184,21 @@ stan_data <- list(
   N = nrow(binned),
   N_exp = nrow(experiment_lut),
   N_sample = nrow(sample_lut),
+  N_group = nrow(group_lut),
   N_bin = n_bins,
   N_s_phase = n_s_phase,
   areaDNA_bin_center = as.numeric(binned$areaDNA_bin_center),
   count = as.integer(binned$count),
   sampleExpID = as.integer(sample_lut$experiment_id),
+  sampleGroupID = as.integer(sample_lut$group_id),
   expID = as.integer(binned$expID),
   sampleID = as.integer(binned$sampleID)
 )
 
 lut <- list(
   experiment = experiment_lut,
-  sample = sample_lut
+  sample = sample_lut,
+  group = group_lut
 )
 
 dir.create(processed_root, recursive = TRUE, showWarnings = FALSE)

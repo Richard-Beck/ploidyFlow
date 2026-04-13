@@ -1,0 +1,263 @@
+Reduced mechanistic flow-cytometry binding model
+
+Purpose
+This note gives a derivation of the reduced mechanistic dye-depletion model for DNA peak shifting in flow cytometry, and states the final recommended equations in a form suitable for implementation.
+
+------------------------------------------------------------------
+1. Starting point
+------------------------------------------------------------------
+
+For sample s and peak class j:
+
+  F_js = a_j * B_j * (K_j * c_s) / (1 + K_j * c_s)
+
+where
+  F_js  = fluorescence of class j in sample s
+  a_j   = instrument / fluorescence conversion factor
+  B_j   = accessible binding sites per particle of class j
+  K_j   = effective association-like binding parameter
+  c_s   = free dye concentration in sample s at equilibrium
+
+Total dye conservation in sample s is:
+
+  D_0 = c_s + sum_j [ n_js * B_j * (K_j * c_s) / (1 + K_j * c_s) ]
+
+where
+  D_0  = total dye added to the tube
+  n_js = number of particles of class j in sample s
+
+This is the full mechanistic starting point.
+
+------------------------------------------------------------------
+2. Safe reparameterizations (no structural change)
+------------------------------------------------------------------
+
+Define
+
+  M_j := a_j * B_j * K_j
+
+Then
+
+  F_js = (M_j * c_s) / (1 + K_j * c_s)
+
+This is just a collection of constants; it does not change the model.
+
+For a tumor peak m relative to the CEN peak C:
+
+  F_ms / F_Cs = [(a_m * B_m * K_m) / (a_C * B_C * K_C)] * [(1 + K_C * c_s) / (1 + K_m * c_s)]
+
+Define the asymptotic high-dye-limit ratio
+
+  R_m,inf := (a_m * B_m * K_m) / (a_C * B_C * K_C)
+
+Then
+
+  F_ms / F_Cs = R_m,inf * (1 + K_C * c_s) / (1 + K_m * c_s)
+
+Interpretation:
+  R_m,inf is the true uncompressed tumor:CEN ratio in the high-dye limit.
+
+------------------------------------------------------------------
+3. Structural Assumption A: common effective tumor binding curve
+------------------------------------------------------------------
+
+Assumption A:
+  All tumor peak classes share the same occupancy-vs-free-dye function, i.e.
+
+    K_m = K_T   for all tumor classes m.
+
+This does NOT mean all tumor peaks have the same fluorescence.
+It means they share the same depletion response curve; they still differ through
+B_m, M_m, and therefore R_m,inf.
+
+Under this assumption,
+
+  F_ms / F_Cs = R_m,inf * (1 + K_C * c_s) / (1 + K_T * c_s)
+
+Define the sample-specific distortion factor
+
+  H_s := (1 + K_C * c_s) / (1 + K_T * c_s)
+
+Then
+
+  F_ms / F_Cs = R_m,inf * H_s
+
+Interpretation:
+  All tumor peaks share the same sample-specific multiplicative distortion relative to CEN.
+
+Special case:
+  If K_T = K_C, then H_s = 1 and tumor:CEN ratios are constant across load.
+  In that case depletion causes only a common-mode shift of all peaks.
+
+------------------------------------------------------------------
+4. Structural Assumption B: tumor binding burden scales with DNA content
+------------------------------------------------------------------
+
+Starting from dye conservation and applying Assumption A:
+
+  D_0 = c_s
+        + n_C,s * B_C * (K_C * c_s) / (1 + K_C * c_s)
+        + [sum_m n_m,s * B_m] * (K_T * c_s) / (1 + K_T * c_s)
+
+Define the total effective tumor binding-site burden
+
+  L_T,s := sum_m [ n_m,s * B_m ]
+
+Assumption B:
+  Accessible sites per tumor particle are modeled as proportional to DNA content:
+
+    B_m = lambda * d_m
+
+where d_m is DNA content in diploid-genome units, e.g.
+  d = 2 for 2N G1
+  d = 3 for diploid S-phase average
+  d = 4 for 2N G2 or 4N G1
+  d = 6 for 4N S-phase average
+  d = 8 for 4N G2 / 8N-class peak, depending on labeling convention
+
+Define the weighted tumor DNA-load proxy
+
+  W_s := sum_m [ n_m,s * d_m ]
+
+Then
+
+  L_T,s = lambda * W_s
+
+If the CEN spike is constant across samples, n_C,s = n_C, so
+
+  D_0 = c_s
+        + n_C * B_C * (K_C * c_s) / (1 + K_C * c_s)
+        + lambda * W_s * (K_T * c_s) / (1 + K_T * c_s)
+
+Interpretation:
+  W_s is the sample-level weighted tumor DNA burden driving dye depletion.
+
+------------------------------------------------------------------
+5. Further consolidation of constants
+------------------------------------------------------------------
+
+Define
+
+  A_C := n_C * B_C
+  A_T := lambda
+
+Then
+
+  D_0 = c_s
+        + A_C * (K_C * c_s) / (1 + K_C * c_s)
+        + A_T * W_s * (K_T * c_s) / (1 + K_T * c_s)
+
+This is still the same mechanistic structure.
+
+------------------------------------------------------------------
+6. Non-dimensionalization
+------------------------------------------------------------------
+
+Absolute dye concentration and binding constants are not separately well identified,
+so rescale the system relative to the CEN binding parameter.
+
+Define
+
+  u_s := K_C * c_s
+  rho := K_T / K_C
+
+Then
+
+  (K_C * c_s) / (1 + K_C * c_s) = u_s / (1 + u_s)
+
+  (K_T * c_s) / (1 + K_T * c_s) = (rho * u_s) / (1 + rho * u_s)
+
+Multiply the dye-conservation equation by K_C and define
+
+  D_tilde   := D_0 * K_C
+  A_C_tilde := A_C * K_C
+  A_T_tilde := A_T * K_C
+
+Then the mass-balance equation becomes
+
+  D_tilde = u_s
+            + A_C_tilde * u_s / (1 + u_s)
+            + A_T_tilde * W_s * (rho * u_s) / (1 + rho * u_s)
+
+Interpretation:
+  u_s is the non-dimensional free-dye state for sample s.
+  rho compares tumor and CEN binding-response curves.
+
+------------------------------------------------------------------
+7. Final recommended reduced mechanistic model
+------------------------------------------------------------------
+
+For each sample s, solve u_s implicitly from
+
+  D_tilde = u_s
+            + A_C_tilde * u_s / (1 + u_s)
+            + A_T_tilde * W_s * (rho * u_s) / (1 + rho * u_s)
+
+Then model the peak means as follows.
+
+CEN peak mean:
+
+  mu_C,s = M_C * u_s / (1 + u_s)
+
+Tumor peak m mean:
+
+  mu_m,s = mu_C,s * R_m,inf * (1 + u_s) / (1 + rho * u_s)
+
+Equivalent ratio form:
+
+  mu_m,s / mu_C,s = R_m,inf * (1 + u_s) / (1 + rho * u_s)
+
+Interpretation:
+  1. Increasing W_s lowers free dye (u_s).
+  2. Lower u_s shifts the CEN peak downward.
+  3. If rho != 1, tumor:CEN spacing also changes with load.
+
+Special case:
+  If rho = 1, then
+
+    mu_m,s / mu_C,s = R_m,inf
+
+  and depletion is purely common-mode.
+
+------------------------------------------------------------------
+8. What this model captures
+------------------------------------------------------------------
+
+This reduced model captures both:
+
+  (i)  a global peak shift through mu_C,s
+  (ii) a differential tumor-vs-CEN compression/expansion through rho
+
+Therefore it is the natural mechanistic form if one believes that:
+  - finite dye availability affects all peaks,
+  - but tumor and CEN may respond differently to declining free dye.
+
+------------------------------------------------------------------
+9. What is safe to simplify, and what is not
+------------------------------------------------------------------
+
+Safe simplifications:
+  - collecting a_j, B_j, K_j into M_j
+  - defining R_m,inf as the asymptotic tumor:CEN ratio
+  - replacing separate tumor K_m with one common K_T (if accepted as a model assumption)
+  - modeling tumor binding burden through W_s
+  - rescaling c_s to u_s
+
+Not safe without additional justification:
+  - low-occupancy linearization: (Kc)/(1+Kc) ~ Kc
+  - high-dye saturation approximation: (Kc)/(1+Kc) ~ 1
+  - forcing rho = 1 unless data support common-mode depletion only
+
+------------------------------------------------------------------
+10. Practical note on fitting
+------------------------------------------------------------------
+
+The most directly learnable parameters from peak-location data are typically
+combinations such as:
+  - R_m,inf
+  - rho
+  - M_C
+  - nuisance load/scale parameters D_tilde, A_C_tilde, A_T_tilde
+
+The model does not usually identify microscopic chemistry parameters separately.
+

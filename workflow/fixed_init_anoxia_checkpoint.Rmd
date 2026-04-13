@@ -1,5 +1,6 @@
 ---
 title: "Fixed-Init Anoxia Checkpoint"
+knit: !expr function(input_file, encoding) rmarkdown::render(input_file, encoding = encoding, output_dir = dirname(input_file), intermediates_dir = dirname(input_file), envir = new.env(parent = globalenv()))
 output:
   html_document:
     toc: true
@@ -8,21 +9,29 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 ---
 
 ```{r setup, include=FALSE}
-input_path <- knitr::current_input()
-workflow_dir <- if (length(input_path) == 0) getwd() else dirname(input_path)
+input_path <- knitr::current_input(dir = TRUE)
+workflow_dir <- if (length(input_path) == 0) {
+  normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+} else {
+  normalizePath(dirname(input_path), winslash = "/", mustWork = TRUE)
+}
 project_root <- normalizePath(file.path(workflow_dir, ".."), winslash = "/", mustWork = TRUE)
 if (!dir.exists(file.path(project_root, "data")) && dir.exists(file.path(getwd(), "data"))) {
   project_root <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
 }
-knitr::opts_knit$set(root.dir = project_root)
+knitr::opts_knit$set(root.dir = workflow_dir)
 knitr::opts_chunk$set(
   echo = FALSE,
   warning = FALSE,
   message = FALSE,
+  cache = TRUE,
+  autodep = TRUE,
   fig.align = "center",
   out.width = "100%",
-  cache.path = "workflow/cache/fixed_init_anoxia_checkpoint/"
+  fig.path = "fixed_init_anoxia_checkpoint_files/figure-html/",
+  cache.path = "cache/fixed_init_anoxia_checkpoint/"
 )
+
 ```
 
 # Goal
@@ -33,30 +42,47 @@ anoxia-only subset.
 This was chosen because - unlike the LTEE experiments ('hypoxia' samples), the CEN peaks all seemed to be in exactly the same location here, and the 2N/4N peaks appeared pretty consistent too.
 
 This document reads the optimizer CSV from
-`results/2026-04-10-fixed-init-anoxia/`, reconstructs the fitted mixture curve
-from the saved parameters, and overlays it on the observed DNA-area histograms.
+`results/2026-04-10-fixed-init-anoxia/`, reconstructs the fitted mixture
+components from the saved parameters, and overlays them on the observed
+DNA-area histograms.
 
-```{r libraries}
+```{r libraries, cache=FALSE}
 library(ggplot2)
 library(knitr)
+source(file.path(project_root, "R", "fit_specs.R"))
 ```
 
-```{r paths}
-experiment_filter <- "anoxia"
-checkpoint_dir <- file.path("results", "2026-04-10-fixed-init-anoxia")
-optimizer_csv <- file.path(checkpoint_dir, "fixed_init_optimize-1.csv")
-dye_ratio_optimizer_csv <- file.path(
-  "processed_data",
-  "stan_optimize_fixed_init_dye_ratio_anoxia",
-  "fixed_init_dye_ratio_optimize-1.csv"
-)
-stan_data_path <- file.path("processed_data", "stan_data.Rds")
-sample_metadata_path <- file.path("processed_data", "anoxia-flowcytometry", "sample_metadata.csv")
+```{r paths, cache=FALSE}
+first_pass_spec <- get_fit_spec("first_pass", project_root = project_root)
+dye_ratio_spec <- get_fit_spec("dye_ratio", project_root = project_root)
+observed_cen_scaled_spec <- get_fit_spec("observed_cen_scaled", project_root = project_root)
 
-stopifnot(file.exists(optimizer_csv))
-stopifnot(file.exists(dye_ratio_optimizer_csv))
-stopifnot(file.exists(stan_data_path))
-stopifnot(file.exists(sample_metadata_path))
+experiment_filter <- first_pass_spec$experiment_filter
+checkpoint_dir <- first_pass_spec$checkpoint_dir
+optimizer_csv <- first_pass_spec$report_csv_path
+dye_ratio_optimizer_csv <- dye_ratio_spec$report_csv_path
+observed_cen_scaled_dir <- file.path(checkpoint_dir, "fits", "observed_cen_scaled")
+observed_cen_scaled_optimizer_csv <- observed_cen_scaled_spec$report_csv_path
+observed_cen_scaled_manifest_path <- observed_cen_scaled_spec$report_manifest_path
+stan_data_path <- first_pass_spec$report_stan_data_path
+sample_metadata_path <- first_pass_spec$report_sample_metadata_path
+observed_cen_scaled_excluded_sample_patterns <- observed_cen_scaled_spec$exclude_sample_patterns
+
+assert_scalar_path_exists <- function(path_value, label) {
+  if (length(path_value) != 1 || !is.character(path_value) || is.na(path_value) || !nzchar(path_value)) {
+    stop(sprintf("Expected %s to be a single non-empty character path.", label))
+  }
+  if (!file.exists(path_value)) {
+    stop(sprintf("%s does not exist: %s", label, path_value))
+  }
+}
+
+assert_scalar_path_exists(optimizer_csv, "optimizer_csv")
+assert_scalar_path_exists(dye_ratio_optimizer_csv, "dye_ratio_optimizer_csv")
+assert_scalar_path_exists(observed_cen_scaled_optimizer_csv, "observed_cen_scaled_optimizer_csv")
+assert_scalar_path_exists(observed_cen_scaled_manifest_path, "observed_cen_scaled_manifest_path")
+assert_scalar_path_exists(stan_data_path, "stan_data_path")
+assert_scalar_path_exists(sample_metadata_path, "sample_metadata_path")
 ```
 
 ```{r helpers}
@@ -214,6 +240,393 @@ add_sample_metadata <- function(plot_df, sample_metadata) {
   plot_df
 }
 
+ensure_plot_file <- function(plot_path, plot_builder, width, height, dpi = 300) {
+  full_plot_path <- file.path(workflow_dir, plot_path)
+  dir.create(dirname(full_plot_path), recursive = TRUE, showWarnings = FALSE)
+
+  if (!file.exists(full_plot_path)) {
+    plot_obj <- plot_builder()
+    ggplot2::ggsave(
+      filename = full_plot_path,
+      plot = plot_obj,
+      width = width,
+      height = height,
+      dpi = dpi,
+      units = "in",
+      limitsize = FALSE
+    )
+  }
+}
+
+render_or_include_plot <- function(plot_path, plot_builder, width, height, element_id, dpi = 300) {
+  ensure_plot_file(plot_path, plot_builder, width, height, dpi)
+
+  plot_src <- gsub("\\\\", "/", plot_path)
+  sprintf(
+    '<img src="%s" id="%s" style="width:100%%;" />',
+    plot_src,
+    element_id
+  )
+}
+
+safe_plot_slug <- function(x) {
+  x <- tolower(x)
+  x <- gsub("[^a-z0-9]+", "-", x)
+  gsub("(^-+|-+$)", "", x)
+}
+
+build_raw_dna_density_df <- function(raw_dna_area, sample_metadata, max_signal = 12000) {
+  sample_metadata$sample_key <- tools::file_path_sans_ext(basename(sample_metadata$sample_name))
+
+  density_df <- do.call(
+    rbind,
+    lapply(names(raw_dna_area), function(sample_name) {
+      values <- raw_dna_area[[sample_name]]
+      values <- values[is.finite(values) & values < max_signal]
+      if (length(values) == 0) {
+        return(NULL)
+      }
+
+      data.frame(
+        sample_name = sample_name,
+        raw_dna_a = values,
+        stringsAsFactors = FALSE
+      )
+    })
+  )
+
+  if (is.null(density_df) || nrow(density_df) == 0) {
+    stop(sprintf("No raw DNA-A values remained after filtering below %s.", max_signal))
+  }
+
+  density_df <- merge(
+    density_df,
+    sample_metadata[, c("sample_key", "condition")],
+    by.x = "sample_name",
+    by.y = "sample_key",
+    all.x = TRUE,
+    sort = FALSE
+  )
+
+  density_df$condition_plot <- ifelse(is.na(density_df$condition), "Unannotated", density_df$condition)
+  density_df$is_control <- density_df$condition_plot %in% c("2N_Control", "4N_Control") | density_df$sample_name == "Sample_CEN"
+  density_df$overlay_group <- ifelse(density_df$is_control, "Controls", density_df$condition_plot)
+  density_df$sample_label <- density_df$sample_name
+  density_df
+}
+
+build_filtered_raw_dna_df <- function(raw_dna_area, sample_metadata, max_signal) {
+  sample_metadata$sample_key <- tools::file_path_sans_ext(basename(sample_metadata$sample_name))
+
+  filtered_df <- do.call(
+    rbind,
+    lapply(names(raw_dna_area), function(sample_name) {
+      values <- raw_dna_area[[sample_name]]
+      values <- values[is.finite(values) & values < max_signal]
+      if (length(values) == 0) {
+        return(NULL)
+      }
+
+      data.frame(
+        sample_name = sample_name,
+        raw_dna_a = values,
+        stringsAsFactors = FALSE
+      )
+    })
+  )
+
+  if (is.null(filtered_df) || nrow(filtered_df) == 0) {
+    stop(sprintf("No raw DNA-A values remained after filtering below %s.", max_signal))
+  }
+
+  filtered_df <- merge(
+    filtered_df,
+    sample_metadata[, c("sample_key", "condition")],
+    by.x = "sample_name",
+    by.y = "sample_key",
+    all.x = TRUE,
+    sort = FALSE
+  )
+
+  filtered_df$condition_plot <- ifelse(is.na(filtered_df$condition), "Unannotated", filtered_df$condition)
+  filtered_df$is_control <- filtered_df$condition_plot %in% c("2N_Control", "4N_Control") | filtered_df$sample_name == "Sample_CEN"
+  filtered_df$overlay_group <- ifelse(filtered_df$is_control, "Controls", filtered_df$condition_plot)
+  filtered_df$sample_label <- filtered_df$sample_name
+  filtered_df
+}
+
+build_raw_dna_all_df <- function(raw_dna_area, sample_metadata) {
+  sample_metadata$sample_key <- tools::file_path_sans_ext(basename(sample_metadata$sample_name))
+
+  raw_df <- do.call(
+    rbind,
+    lapply(names(raw_dna_area), function(sample_name) {
+      values <- raw_dna_area[[sample_name]]
+      values <- values[is.finite(values)]
+      if (length(values) == 0) {
+        return(NULL)
+      }
+
+      data.frame(
+        sample_name = sample_name,
+        raw_dna_a = values,
+        stringsAsFactors = FALSE
+      )
+    })
+  )
+
+  if (is.null(raw_df) || nrow(raw_df) == 0) {
+    stop("No raw DNA-A values were available.")
+  }
+
+  raw_df <- merge(
+    raw_df,
+    sample_metadata[, c("sample_key", "condition")],
+    by.x = "sample_name",
+    by.y = "sample_key",
+    all.x = TRUE,
+    sort = FALSE
+  )
+
+  raw_df$condition_plot <- ifelse(is.na(raw_df$condition), "Unannotated", raw_df$condition)
+  raw_df$is_control <- raw_df$condition_plot %in% c("2N_Control", "4N_Control") | raw_df$sample_name == "Sample_CEN"
+  raw_df$overlay_group <- ifelse(raw_df$is_control, "Controls", raw_df$condition_plot)
+  raw_df$sample_label <- raw_df$sample_name
+  raw_df
+}
+
+build_condition_palette <- function(condition_values) {
+  base_palette <- c(
+    "Controls" = "#1b9e77",
+    "A1" = "#7570b3",
+    "AOA" = "#e7298a",
+    "AN" = "#66a61e",
+    "H1" = "#e6ab02",
+    "HN" = "#a6761d",
+    "HOH" = "#1f78b4",
+    "N1" = "#b2df8a",
+    "Unannotated" = "#666666"
+  )
+
+  missing_conditions <- setdiff(condition_values, names(base_palette))
+  if (length(missing_conditions) > 0) {
+    extra_cols <- grDevices::hcl.colors(length(missing_conditions), palette = "Dark 3")
+    names(extra_cols) <- missing_conditions
+    base_palette <- c(base_palette, extra_cols)
+  }
+
+  base_palette[condition_values]
+}
+
+plot_raw_dna_quantiles <- function(density_df, color_values, max_signal = 12000) {
+  sample_order_df <- unique(density_df[, c("sample_label", "overlay_group", "is_control")])
+  sample_order_df <- sample_order_df[order(sample_order_df$is_control, sample_order_df$overlay_group, sample_order_df$sample_label), , drop = FALSE]
+  density_df$sample_label <- factor(density_df$sample_label, levels = sample_order_df$sample_label)
+
+  ggplot(density_df, aes(x = sample_label, y = raw_dna_a, color = overlay_group)) +
+    geom_boxplot(
+      width = 0.65,
+      outlier.shape = NA,
+      fill = NA,
+      linewidth = 0.7
+    ) +
+    coord_flip() +
+    scale_color_manual(values = color_values, drop = FALSE) +
+    labs(
+      title = sprintf("Raw DNA-A quantiles per sample after filtering below %s", scales::comma(max_signal)),
+      subtitle = "Samples are ordered by the same overlay grouping used in the histogram panels.",
+      x = NULL,
+      y = "Raw DNA-A signal",
+      color = "Overlay group"
+    ) +
+    theme_bw(base_size = 13.5) +
+    theme(
+      axis.text.y = element_text(size = 9.5),
+      panel.grid.minor = element_blank()
+    )
+}
+
+build_mode_bin_df <- function(density_df, bin_width) {
+  non_control_df <- density_df[!density_df$is_control, , drop = FALSE]
+  if (nrow(non_control_df) == 0) {
+    stop("No non-control samples available for mode-bin plotting.")
+  }
+
+  non_control_df$bin_center <- floor(non_control_df$raw_dna_a / bin_width) * bin_width + (bin_width / 2)
+
+  count_df <- aggregate(
+    raw_dna_a ~ sample_label + overlay_group + bin_center,
+    data = non_control_df,
+    FUN = length
+  )
+  names(count_df)[names(count_df) == "raw_dna_a"] <- "bin_count"
+
+  mode_idx <- unlist(tapply(seq_len(nrow(count_df)), count_df$sample_label, function(idx) {
+    sample_counts <- count_df[idx, , drop = FALSE]
+    idx[order(-sample_counts$bin_count, sample_counts$bin_center)[1]]
+  }))
+
+  mode_df <- count_df[mode_idx, , drop = FALSE]
+  sample_order_df <- unique(mode_df[, c("sample_label", "overlay_group")])
+  sample_order_df <- sample_order_df[order(sample_order_df$overlay_group, sample_order_df$sample_label), , drop = FALSE]
+  mode_df$sample_label <- factor(mode_df$sample_label, levels = sample_order_df$sample_label)
+  mode_df
+}
+
+plot_mode_bin_locations <- function(mode_df, color_values, bin_width) {
+  ggplot(mode_df, aes(x = bin_center, y = sample_label, color = overlay_group)) +
+    geom_point(size = 2.6) +
+    scale_color_manual(values = color_values, drop = FALSE) +
+    labs(
+      title = "Most-populated raw DNA-A bin per non-control sample",
+      subtitle = sprintf("Computed from filtered raw DNA-A values below 12,000 using bin width %s.", scales::comma(bin_width)),
+      x = "Location of most-populated bin",
+      y = NULL,
+      color = "Overlay group"
+    ) +
+    theme_bw(base_size = 13.5) +
+    theme(
+      axis.text.y = element_text(size = 9.5),
+      panel.grid.minor = element_blank()
+    )
+}
+
+build_mode_vs_median_df <- function(raw_all_df, raw_filtered_df, bin_width) {
+  mode_df <- build_mode_bin_df(
+    density_df = raw_all_df,
+    bin_width = bin_width
+  )
+
+  median_df <- aggregate(
+    raw_dna_a ~ sample_label + overlay_group,
+    data = raw_filtered_df[!raw_filtered_df$is_control, , drop = FALSE],
+    FUN = median
+  )
+  names(median_df)[names(median_df) == "raw_dna_a"] <- "median_filtered_raw_dna_a"
+
+  scatter_df <- merge(
+    mode_df[, c("sample_label", "overlay_group", "bin_center")],
+    median_df,
+    by = c("sample_label", "overlay_group"),
+    all = FALSE,
+    sort = FALSE
+  )
+
+  sample_order_df <- unique(scatter_df[, c("sample_label", "overlay_group")])
+  sample_order_df <- sample_order_df[order(sample_order_df$overlay_group, sample_order_df$sample_label), , drop = FALSE]
+  scatter_df$sample_label <- factor(scatter_df$sample_label, levels = sample_order_df$sample_label)
+  scatter_df
+}
+
+plot_mode_vs_median <- function(scatter_df, color_values, median_filter_threshold) {
+  line_fit <- lm(bin_center ~ median_filtered_raw_dna_a, data = scatter_df)
+  line_summary <- summary(line_fit)
+  line_slope <- unname(coef(line_fit)[["median_filtered_raw_dna_a"]])
+  line_r_squared <- line_summary$r.squared
+
+  x_vals <- scatter_df$median_filtered_raw_dna_a
+  y_vals <- scatter_df$bin_center
+  line_annotation <- sprintf(
+    "line slope = %.4f\nline R^2 = %.4f",
+    line_slope,
+    line_r_squared
+  )
+
+  fit_grid <- data.frame(
+    median_filtered_raw_dna_a = seq(min(x_vals, na.rm = TRUE), max(x_vals, na.rm = TRUE), length.out = 200)
+  )
+  fit_grid$line_pred <- predict(line_fit, newdata = fit_grid)
+
+  x_range <- range(x_vals, na.rm = TRUE)
+  y_range <- range(y_vals, na.rm = TRUE)
+  annotation_df <- data.frame(
+    median_filtered_raw_dna_a = x_range[1] + 0.05 * diff(x_range),
+    bin_center = y_range[2] - 0.05 * diff(y_range),
+    label = line_annotation
+  )
+
+  ggplot(scatter_df, aes(x = median_filtered_raw_dna_a, y = bin_center, color = overlay_group)) +
+    geom_point(size = 2.8) +
+    geom_line(
+      data = fit_grid,
+      inherit.aes = FALSE,
+      aes(x = median_filtered_raw_dna_a, y = line_pred),
+      color = "black",
+      linewidth = 0.8
+    ) +
+    geom_label(
+      data = annotation_df,
+      inherit.aes = FALSE,
+      aes(x = median_filtered_raw_dna_a, y = bin_center, label = label),
+      hjust = 0,
+      vjust = 1,
+      size = 3.5,
+      label.size = 0.25
+    ) +
+    scale_color_manual(values = color_values, drop = FALSE) +
+    labs(
+      title = "Filtered raw DNA-A median vs most-populated raw DNA-A bin",
+      subtitle = sprintf("Controls excluded. Median computed after filtering raw DNA-A below %s.", scales::comma(median_filter_threshold)),
+      x = "Median raw DNA-A signal after filtering",
+      y = "Location of most-populated raw DNA-A bin",
+      color = "Overlay group"
+    ) +
+    theme_bw(base_size = 13.5) +
+    theme(
+      panel.grid.minor = element_blank()
+    )
+}
+
+build_mode_vs_fraction_above_threshold_df <- function(raw_all_df, bin_width, threshold = 12000) {
+  mode_df <- build_mode_bin_df(
+    density_df = raw_all_df,
+    bin_width = bin_width
+  )
+
+  non_control_df <- raw_all_df[!raw_all_df$is_control, , drop = FALSE]
+  if (nrow(non_control_df) == 0) {
+    stop("No non-control samples available for fraction-above-threshold plotting.")
+  }
+
+  fraction_df <- aggregate(
+    raw_dna_a ~ sample_label + overlay_group,
+    data = non_control_df,
+    FUN = function(values) mean(values > threshold)
+  )
+  names(fraction_df)[names(fraction_df) == "raw_dna_a"] <- "fraction_above_threshold"
+
+  scatter_df <- merge(
+    mode_df[, c("sample_label", "overlay_group", "bin_center")],
+    fraction_df,
+    by = c("sample_label", "overlay_group"),
+    all = FALSE,
+    sort = FALSE
+  )
+
+  sample_order_df <- unique(scatter_df[, c("sample_label", "overlay_group")])
+  sample_order_df <- sample_order_df[order(sample_order_df$overlay_group, sample_order_df$sample_label), , drop = FALSE]
+  scatter_df$sample_label <- factor(scatter_df$sample_label, levels = sample_order_df$sample_label)
+  scatter_df
+}
+
+plot_mode_vs_fraction_above_threshold <- function(scatter_df, color_values, threshold = 12000) {
+  ggplot(scatter_df, aes(x = bin_center, y = fraction_above_threshold, color = overlay_group)) +
+    geom_point(size = 2.8) +
+    scale_color_manual(values = color_values, drop = FALSE) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(
+      title = "Fraction of cells above DNA-A 12,000 vs most-populated raw DNA-A bin",
+      subtitle = sprintf("Controls excluded. Fractions are computed from all finite raw DNA-A values using threshold %s.", scales::comma(threshold)),
+      x = "Location of most-populated raw DNA-A bin",
+      y = "Fraction of cells above threshold",
+      color = "Overlay group"
+    ) +
+    theme_bw(base_size = 13.5) +
+    theme(
+      panel.grid.minor = element_blank()
+    )
+}
+
 build_peak_line_df <- function(plot_df) {
   peak_line_df <- unique(plot_df[, c(
     "sample_label",
@@ -278,6 +691,7 @@ plot_overlay_subset <- function(
       panel.grid.minor = element_blank()
     )
 }
+
 
 plot_condition_overlay <- function(
   plot_df,
@@ -437,6 +851,7 @@ plot_controls_ecdf <- function(
     )
 }
 
+
 build_population_fraction_df <- function(theta, plot_df) {
   sample_fraction_df <- data.frame(
     sampleID = seq_len(nrow(theta)),
@@ -525,22 +940,288 @@ build_dye_ratio_global_param_tbl <- function(opt_row, n_exp = 1L) {
 
   rbind(scalar_tbl, vector_tbl)
 }
-```
 
-```{r load-data}
-stan_bundle <- readRDS(stan_data_path)
-stan_data <- stan_bundle$stan_data
-if (is.null(stan_data$N_s_phase)) {
-  stan_data$N_s_phase <- 3L
+derive_sample_group <- function(sample_name) {
+  sample_id <- tools::file_path_sans_ext(basename(sample_name))
+
+  if (identical(sample_id, "Sample_CEN")) {
+    return("CEN")
+  }
+
+  if (grepl("^Sample_SUM159_", sample_id)) {
+    return(sub("^Sample_SUM159_([0-9]+_)?", "", sample_id))
+  }
+
+  sample_id
 }
 
-filtered_bundle <- subset_stan_bundle_by_experiment(
-  stan_data = stan_data,
-  lut = stan_bundle$lut,
-  experiment_pattern = experiment_filter
+augment_stan_bundle_with_groups <- function(stan_data, lut) {
+  sample_groups <- vapply(lut$sample$sample_name, derive_sample_group, character(1))
+  group_levels <- unique(sample_groups)
+  group_lut <- data.frame(
+    group_id = seq_along(group_levels),
+    group_name = group_levels,
+    stringsAsFactors = FALSE
+  )
+
+  lut$sample$sample_group <- sample_groups
+  lut$sample$group_id <- match(sample_groups, group_lut$group_name)
+  lut$group <- group_lut
+  stan_data$N_group <- nrow(group_lut)
+  stan_data$sampleGroupID <- as.integer(lut$sample$group_id)
+
+  list(stan_data = stan_data, lut = lut)
+}
+
+exclude_samples_from_stan_bundle <- function(stan_data, lut, sample_patterns) {
+  if (length(sample_patterns) == 0) {
+    return(list(
+      stan_data = stan_data,
+      lut = lut,
+      excluded_samples = lut$sample[FALSE, , drop = FALSE]
+    ))
+  }
+
+  sample_name <- tools::file_path_sans_ext(basename(lut$sample$sample_name))
+  exclude_samples <- Reduce(`|`, lapply(
+    sample_patterns,
+    function(pattern) grepl(pattern, sample_name, ignore.case = TRUE)
+  ))
+
+  if (!any(exclude_samples)) {
+    return(list(
+      stan_data = stan_data,
+      lut = lut,
+      excluded_samples = lut$sample[FALSE, , drop = FALSE]
+    ))
+  }
+
+  keep_samples <- !exclude_samples
+  old_sample_ids <- lut$sample$sample_id[keep_samples]
+  keep_bins <- stan_data$sampleID %in% old_sample_ids
+  sample_map <- setNames(seq_along(old_sample_ids), old_sample_ids)
+
+  excluded_samples <- lut$sample[exclude_samples, , drop = FALSE]
+  sample_lut <- lut$sample[keep_samples, , drop = FALSE]
+  sample_lut$sample_id <- seq_len(nrow(sample_lut))
+
+  stan_data$areaDNA_bin_center <- stan_data$areaDNA_bin_center[keep_bins]
+  stan_data$count <- stan_data$count[keep_bins]
+  stan_data$expID <- stan_data$expID[keep_bins]
+  stan_data$sampleID <- unname(sample_map[as.character(stan_data$sampleID[keep_bins])])
+  stan_data$sampleExpID <- sample_lut$experiment_id
+  stan_data$N <- length(stan_data$count)
+  stan_data$N_sample <- nrow(sample_lut)
+
+  list(
+    stan_data = stan_data,
+    lut = list(
+      experiment = lut$experiment,
+      sample = sample_lut
+    ),
+    excluded_samples = excluded_samples
+  )
+}
+
+build_overlay_df_observed_cen_scaled <- function(
+  stan_data,
+  lut,
+  mu_cen,
+  ratio_tumor_cen_sample,
+  R_4n_sample,
+  R_8n_sample,
+  cv,
+  theta,
+  dye_scale_sample
+) {
+  x <- stan_data$areaDNA_bin_center
+  bin_width <- diff(sort(unique(x)))[1]
+
+  plot_df <- data.frame(
+    areaDNA_bin_center = stan_data$areaDNA_bin_center,
+    count = stan_data$count,
+    expID = stan_data$expID,
+    sampleID = stan_data$sampleID,
+    stringsAsFactors = FALSE
+  )
+
+  sample_totals <- aggregate(count ~ sampleID, data = plot_df, FUN = sum)
+  names(sample_totals)[2] <- "sample_total"
+  plot_df <- merge(plot_df, sample_totals, by = "sampleID", sort = FALSE)
+
+  plot_df$mixture_count <- mapply(
+    FUN = function(x_i, sample_id, exp_id, sample_total) {
+      mu_cen_sample <- mu_cen[exp_id] * dye_scale_sample[sample_id]
+      sig_cen <- mu_cen_sample * cv
+      mu_2n <- mu_cen_sample * ratio_tumor_cen_sample[sample_id]
+      mu_4n <- mu_2n * R_4n_sample[sample_id]
+      mu_8n <- mu_4n * R_8n_sample[sample_id]
+      sig_2n <- mu_2n * cv
+      sig_4n <- mu_4n * cv
+      sig_8n <- mu_8n * cv
+
+      density_val <- theta[sample_id, 1] * dnorm(x_i, mean = mu_cen_sample, sd = sig_cen) +
+        theta[sample_id, 2] * dnorm(x_i, mean = mu_2n, sd = sig_2n) +
+        theta[sample_id, 3] * dnorm(x_i, mean = mu_4n, sd = sig_4n) +
+        theta[sample_id, 4] * dnorm(x_i, mean = mu_8n, sd = sig_8n) +
+        theta[sample_id, 5] * s_phase_density(x_i, mu_2n, mu_4n, stan_data$N_s_phase) +
+        theta[sample_id, 6] * s_phase_density(x_i, mu_4n, mu_8n, stan_data$N_s_phase) +
+        theta[sample_id, 7] * dnorm(x_i, mean = 2 * mu_cen_sample, sd = sqrt(2) * sig_cen)
+
+      sample_total * bin_width * density_val
+    },
+    x_i = plot_df$areaDNA_bin_center,
+    sample_id = plot_df$sampleID,
+    exp_id = plot_df$expID,
+    sample_total = plot_df$sample_total
+  )
+
+  peak_df <- data.frame(
+    sampleID = seq_len(nrow(lut$sample)),
+    expID = lut$sample$experiment_id,
+    stringsAsFactors = FALSE
+  )
+  peak_df$mu_cen <- mu_cen[peak_df$expID] * dye_scale_sample[peak_df$sampleID]
+  peak_df$mu_2n <- peak_df$mu_cen * ratio_tumor_cen_sample[peak_df$sampleID]
+  peak_df$mu_4n <- peak_df$mu_2n * R_4n_sample[peak_df$sampleID]
+  peak_df$mu_8n <- peak_df$mu_4n * R_8n_sample[peak_df$sampleID]
+  peak_df$mu_4n_ratio_2 <- 2 * peak_df$mu_2n
+
+  plot_df <- merge(
+    plot_df,
+    lut$sample[, c("sample_id", "sample_name", "experiment_name", "sample_group")],
+    by.x = "sampleID",
+    by.y = "sample_id",
+    all.x = TRUE,
+    sort = FALSE
+  )
+
+  plot_df <- merge(
+    plot_df,
+    peak_df[, c("sampleID", "mu_cen", "mu_2n", "mu_4n", "mu_8n", "mu_4n_ratio_2")],
+    by = "sampleID",
+    all.x = TRUE,
+    sort = FALSE
+  )
+
+  plot_df$sample_label <- sprintf("%s | %s", plot_df$experiment_name, plot_df$sample_name)
+  plot_df
+}
+
+build_observed_cen_scaled_param_tbl <- function(opt_row, n_exp = 1L) {
+  scalar_tbl <- data.frame(
+    parameter = c(
+      "lp__",
+      "cv",
+      "ratio_tumor_cen_geometric_mean",
+      "R_4n_geometric_mean",
+      "R_8n_geometric_mean",
+      "D_tilde",
+      "A_C_tilde",
+      "A_T_tilde",
+      "rho",
+      "sigma_group_extra_load",
+      "sigma_group_diploid_phase[1]",
+      "sigma_group_diploid_phase[2]",
+      "sigma_group_wgd_phase[1]",
+      "sigma_group_wgd_phase[2]"
+    ),
+    value = signif(c(
+      opt_row$lp__[1],
+      opt_row$cv[1],
+      exp(opt_row$log_ratio_tumor_cen_mu[1]),
+      exp(opt_row$log_R_4n_mu[1]),
+      exp(opt_row$log_R_8n_mu[1]),
+      exp(opt_row$log_D_tilde[1]),
+      exp(opt_row$log_A_C_tilde[1]),
+      exp(opt_row$log_A_T_tilde[1]),
+      exp(opt_row$log_rho[1]),
+      opt_row$sigma_group_extra_load[1],
+      opt_row$`sigma_group_diploid_phase.1`[1],
+      opt_row$`sigma_group_diploid_phase.2`[1],
+      opt_row$`sigma_group_wgd_phase.1`[1],
+      opt_row$`sigma_group_wgd_phase.2`[1]
+    ), 6)
+  )
+
+  vector_tbl <- do.call(
+    rbind,
+    lapply(list(mu_cen = n_exp), function(n_vals) NULL)
+  )
+  vector_tbl <- data.frame(
+    parameter = sprintf("mu_cen[%d]", seq_len(n_exp)),
+    value = signif(extract_indexed_vector(opt_row, "mu_cen", n_exp), 6)
+  )
+
+  rbind(scalar_tbl, vector_tbl)
+}
+
+softmax3 <- function(eta) {
+  eta <- eta - max(eta)
+  exp(eta) / sum(exp(eta))
+}
+
+extract_group_phase_tbl_observed_cen_scaled <- function(opt_row, lut) {
+  out <- vector("list", nrow(lut$group))
+
+  for (g in seq_len(nrow(lut$group))) {
+    dip_eta <- c(
+      0,
+      opt_row$`diploid_phase_global_logit.1`[1] +
+        opt_row$`sigma_group_diploid_phase.1`[1] * opt_row[[sprintf("z_group_diploid_phase.1.%d", g)]],
+      opt_row$`diploid_phase_global_logit.2`[1] +
+        opt_row$`sigma_group_diploid_phase.2`[1] * opt_row[[sprintf("z_group_diploid_phase.2.%d", g)]]
+    )
+    wgd_eta <- c(
+      0,
+      opt_row$`wgd_phase_global_logit.1`[1] +
+        opt_row$`sigma_group_wgd_phase.1`[1] * opt_row[[sprintf("z_group_wgd_phase.1.%d", g)]],
+      opt_row$`wgd_phase_global_logit.2`[1] +
+        opt_row$`sigma_group_wgd_phase.2`[1] * opt_row[[sprintf("z_group_wgd_phase.2.%d", g)]]
+    )
+
+    dip <- softmax3(dip_eta)
+    wgd <- softmax3(wgd_eta)
+
+    out[[g]] <- data.frame(
+      group_name = lut$group$group_name[g],
+      state = c("Diploid", "Diploid", "Diploid", "WGD", "WGD", "WGD"),
+      phase = rep(c("G0/G1", "S", "G2/M"), 2),
+      fraction = c(dip, wgd),
+      stringsAsFactors = FALSE
+    )
+  }
+
+  do.call(rbind, out)
+}
+
+plot_group_phase_fractions_observed_cen_scaled <- function(group_phase_df) {
+  ggplot(group_phase_df, aes(x = group_name, y = fraction, fill = phase)) +
+    geom_col(width = 0.82) +
+    facet_wrap(~ state, ncol = 1) +
+    scale_y_continuous(labels = function(x) sprintf("%d%%", round(100 * x))) +
+    labs(
+      title = "Observed-CEN-scaled fit: estimated phase fractions by group",
+      x = "Sample group",
+      y = "Phase fraction",
+      fill = "Phase"
+    ) +
+    theme_bw(base_size = 13.5) +
+    theme(
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+}
+```
+
+```{r load-data, cache=FALSE}
+prepared_first_pass <- prepare_fit_inputs(
+  spec = first_pass_spec,
+  project_root = project_root,
+  stan_data_path = stan_data_path
 )
-stan_data <- filtered_bundle$stan_data
-lut <- filtered_bundle$lut
+stan_data <- prepared_first_pass$stan_data
+lut <- prepared_first_pass$lut
 
 opt_row <- read.csv(optimizer_csv, comment.char = "#", check.names = FALSE)[1, , drop = FALSE]
 sample_metadata <- read.csv(sample_metadata_path, stringsAsFactors = FALSE)
@@ -598,12 +1279,27 @@ bin_width <- diff(sort(unique(overlay_df$areaDNA_bin_center)))[1]
 condition_levels <- sort(unique(overlay_df$condition_plot))
 ```
 
-```{r optimized-overlay, fig.width=16, fig.height=8}
-
-print(plot_controls_overlay(overlay_df, bin_width))
+```{r optimized-overlay, results='asis', cache=FALSE}
+cat(render_or_include_plot(
+  plot_path = file.path("fixed_init_anoxia_checkpoint_files", "manual", "optimized-overlay-controls.png"),
+  plot_builder = function() plot_controls_overlay(overlay_df, bin_width),
+  width = 16,
+  height = 8,
+  element_id = "optimized-overlay-controls"
+))
 
 for (condition_value in condition_levels) {
-  print(plot_condition_overlay(overlay_df, condition_value, bin_width))
+  cat(render_or_include_plot(
+    plot_path = file.path(
+      "fixed_init_anoxia_checkpoint_files",
+      "manual",
+      sprintf("optimized-overlay-%s.png", safe_plot_slug(condition_value))
+    ),
+    plot_builder = function() plot_condition_overlay(overlay_df, condition_value, bin_width),
+    width = 16,
+    height = 8,
+    element_id = sprintf("optimized-overlay-%s", safe_plot_slug(condition_value))
+  ))
 }
 ```
 
@@ -644,22 +1340,37 @@ dye_ratio_overlay_df <- add_sample_metadata(dye_ratio_overlay_df, sample_metadat
 dye_ratio_theta <- extract_theta_matrix(dye_ratio_opt_row, stan_data$N_sample)
 ```
 
-```{r dye-ratio-overlay, fig.width=16, fig.height=8}
-
-print(plot_controls_overlay(
-  dye_ratio_overlay_df,
-  bin_width,
-  title_prefix = "Dye-ratio fixed-init optimization overlay",
-  subtitle_path = dye_ratio_optimizer_csv
-))
-
-for (condition_value in condition_levels) {
-  print(plot_condition_overlay(
+```{r dye-ratio-overlay, results='asis', cache=FALSE}
+cat(render_or_include_plot(
+  plot_path = file.path("fixed_init_anoxia_checkpoint_files", "manual", "dye-ratio-overlay-controls.png"),
+  plot_builder = function() plot_controls_overlay(
     dye_ratio_overlay_df,
-    condition_value,
     bin_width,
     title_prefix = "Dye-ratio fixed-init optimization overlay",
     subtitle_path = dye_ratio_optimizer_csv
+  ),
+  width = 16,
+  height = 8,
+  element_id = "dye-ratio-overlay-controls"
+))
+
+for (condition_value in condition_levels) {
+  cat(render_or_include_plot(
+    plot_path = file.path(
+      "fixed_init_anoxia_checkpoint_files",
+      "manual",
+      sprintf("dye-ratio-overlay-%s.png", safe_plot_slug(condition_value))
+    ),
+    plot_builder = function() plot_condition_overlay(
+      dye_ratio_overlay_df,
+      condition_value,
+      bin_width,
+      title_prefix = "Dye-ratio fixed-init optimization overlay",
+      subtitle_path = dye_ratio_optimizer_csv
+    ),
+    width = 16,
+    height = 8,
+    element_id = sprintf("dye-ratio-overlay-%s", safe_plot_slug(condition_value))
   ))
 }
 ```
@@ -674,7 +1385,7 @@ population_fraction_df <- build_population_fraction_df(
 )
 ```
 
-```{r dye-ratio-population-fractions, fig.width=18, fig.height=9}
+```{r dye-ratio-population-fractions, fig.width=18, fig.height=9, cache=FALSE}
 print(plot_population_fractions(population_fraction_df))
 ```
 
@@ -692,7 +1403,7 @@ dye_ratio_ecdf_df <- build_ecdf_df(
 )
 ```
 
-```{r dye-ratio-ecdf, fig.width=16, fig.height=8}
+```{r dye-ratio-ecdf, fig.width=16, fig.height=8, cache=FALSE}
 print(plot_controls_ecdf(
   dye_ratio_ecdf_df,
   title_prefix = "Dye-ratio fit ECDF comparison",
@@ -708,3 +1419,153 @@ for (condition_value in condition_levels) {
   ))
 }
 ```
+
+# Observed-CEN-Scaled Fluorescence Model
+
+This keeps the original dye-ratio section intact as a reference point, but adds
+the newer fluorescence derivation. In this model, the observed CEN fraction is
+used to scale the tumor DNA load proxy, the fluorescence compression is derived
+from the reduced mechanistic free-dye model, and the diploid/WGD G0/G1/S/G2/M
+ratios are allowed small group-level deviations around a global baseline.
+
+```{r observed-cen-scaled-load}
+observed_cen_scaled_manifest <- readRDS(observed_cen_scaled_manifest_path)
+
+observed_cen_scaled_bundle <- prepare_fit_inputs(
+  spec = observed_cen_scaled_spec,
+  project_root = project_root,
+  stan_data_path = stan_data_path
+)
+observed_cen_scaled_stan_data <- observed_cen_scaled_bundle$stan_data
+observed_cen_scaled_lut <- observed_cen_scaled_bundle$lut
+observed_cen_scaled_opt_row <- read.csv(
+  observed_cen_scaled_optimizer_csv,
+  comment.char = "#",
+  check.names = FALSE
+)[1, , drop = FALSE]
+```
+
+```{r observed-cen-scaled-summary}
+observed_cen_scaled_param_tbl <- build_observed_cen_scaled_param_tbl(
+  opt_row = observed_cen_scaled_opt_row,
+  n_exp = observed_cen_scaled_stan_data$N_exp
+)
+
+kable(observed_cen_scaled_param_tbl, digits = 4)
+```
+
+```{r observed-cen-scaled-overlay-data, cache=TRUE}
+observed_cen_scaled_overlay_df <- build_overlay_df_observed_cen_scaled(
+  stan_data = observed_cen_scaled_stan_data,
+  lut = observed_cen_scaled_lut,
+  mu_cen = extract_indexed_vector(observed_cen_scaled_opt_row, "mu_cen", observed_cen_scaled_stan_data$N_exp),
+  ratio_tumor_cen_sample = extract_indexed_vector(observed_cen_scaled_opt_row, "ratio_tumor_cen_sample", observed_cen_scaled_stan_data$N_sample),
+  R_4n_sample = extract_indexed_vector(observed_cen_scaled_opt_row, "R_4n_sample", observed_cen_scaled_stan_data$N_sample),
+  R_8n_sample = extract_indexed_vector(observed_cen_scaled_opt_row, "R_8n_sample", observed_cen_scaled_stan_data$N_sample),
+  cv = observed_cen_scaled_opt_row$cv[1],
+  theta = extract_theta_matrix(observed_cen_scaled_opt_row, observed_cen_scaled_stan_data$N_sample),
+  dye_scale_sample = extract_indexed_vector(observed_cen_scaled_opt_row, "dye_scale_sample", observed_cen_scaled_stan_data$N_sample)
+)
+observed_cen_scaled_overlay_df <- add_sample_metadata(observed_cen_scaled_overlay_df, sample_metadata)
+observed_cen_scaled_theta <- extract_theta_matrix(observed_cen_scaled_opt_row, observed_cen_scaled_stan_data$N_sample)
+observed_cen_scaled_bin_width <- diff(sort(unique(observed_cen_scaled_overlay_df$areaDNA_bin_center)))[1]
+```
+
+```{r observed-cen-scaled-overlay, results='asis', cache=FALSE}
+cat(render_or_include_plot(
+  plot_path = file.path("fixed_init_anoxia_checkpoint_files", "manual", "observed-cen-scaled-overlay-controls.png"),
+  plot_builder = function() plot_controls_overlay(
+    observed_cen_scaled_overlay_df,
+    observed_cen_scaled_bin_width,
+    title_prefix = "Observed-CEN-scaled optimization overlay",
+    subtitle_path = observed_cen_scaled_manifest$output_file
+  ),
+  width = 16,
+  height = 8,
+  element_id = "observed-cen-scaled-overlay-controls"
+))
+
+for (condition_value in condition_levels) {
+  cat(render_or_include_plot(
+    plot_path = file.path(
+      "fixed_init_anoxia_checkpoint_files",
+      "manual",
+      sprintf("observed-cen-scaled-overlay-%s.png", safe_plot_slug(condition_value))
+    ),
+    plot_builder = function() plot_condition_overlay(
+      observed_cen_scaled_overlay_df,
+      condition_value,
+      observed_cen_scaled_bin_width,
+      title_prefix = "Observed-CEN-scaled optimization overlay",
+      subtitle_path = observed_cen_scaled_manifest$output_file
+    ),
+    width = 16,
+    height = 8,
+    element_id = sprintf("observed-cen-scaled-overlay-%s", safe_plot_slug(condition_value))
+  ))
+}
+```
+
+```{r observed-cen-scaled-population-fractions-data, cache=TRUE}
+observed_cen_scaled_population_fraction_df <- build_population_fraction_df(
+  theta = observed_cen_scaled_theta,
+  plot_df = observed_cen_scaled_overlay_df
+)
+```
+
+```{r observed-cen-scaled-population-fractions, fig.width=18, fig.height=9, cache=FALSE}
+print(
+  plot_population_fractions(observed_cen_scaled_population_fraction_df) +
+    labs(title = "Observed-CEN-scaled fit: population fractions by sample")
+)
+```
+
+```{r observed-cen-scaled-ecdf-data, cache=TRUE}
+observed_cen_scaled_ecdf_df <- build_ecdf_df(
+  plot_df = observed_cen_scaled_overlay_df,
+  theta = observed_cen_scaled_theta,
+  cv = observed_cen_scaled_opt_row$cv[1]
+)
+```
+
+```{r observed-cen-scaled-ecdf, fig.width=16, fig.height=8, cache=FALSE}
+print(plot_controls_ecdf(
+  observed_cen_scaled_ecdf_df,
+  title_prefix = "Observed-CEN-scaled fit ECDF comparison",
+  subtitle_path = observed_cen_scaled_manifest$output_file
+))
+
+for (condition_value in condition_levels) {
+  print(plot_condition_ecdf(
+    observed_cen_scaled_ecdf_df,
+    condition_value,
+    title_prefix = "Observed-CEN-scaled fit ECDF comparison",
+    subtitle_path = observed_cen_scaled_manifest$output_file
+  ))
+}
+```
+
+```{r observed-cen-scaled-group-phase-data, cache=TRUE}
+observed_cen_scaled_group_phase_df <- extract_group_phase_tbl_observed_cen_scaled(
+  opt_row = observed_cen_scaled_opt_row,
+  lut = observed_cen_scaled_lut
+)
+```
+
+```{r observed-cen-scaled-group-phase, fig.width=14, fig.height=10, cache=FALSE}
+print(plot_group_phase_fractions_observed_cen_scaled(observed_cen_scaled_group_phase_df))
+```
+
+# Model Comparison
+
+The original dye-ratio fit above is still useful as a baseline because it shows
+what the simpler peak-shift story was doing. The newer observed-CEN-scaled
+model changes two things at once: it uses the revised fluorescence derivation,
+and it allows slight group-level deviations in the diploid/WGD phase ratios.
+
+The practical comparison to focus on is:
+
+1. Whether the overlay and ECDF diagnostics improve in the conditions where the
+   older dye-ratio model had to distort the inferred CEN/tumor ratio.
+2. Whether the fitted group-level phase deviations remain small, which would
+   support the intended “mostly global, slightly group-specific” interpretation.
