@@ -1,0 +1,16 @@
+1. Fixative Selection: Ethanol over Formaldehyde
+The Formaldehyde Problem: Formaldehyde covalently cross-links chromatin, physically obstructing the minor groove where FxCycle Violet binds. This prevents stoichiometric dye binding, broadens the Coefficients of Variation (CVs), and degrades the resolution needed to identify subtle aneuploidies or accurately run algorithmic peak-finding.
+
+The Ethanol Solution: Cold 70% ethanol is the standard for pure ploidy analysis. It precipitates proteins without cross-linking the DNA, allowing strictly stoichiometric dye binding and sharp CVs.
+
+Binucleation: Crucially, ethanol leaves the cellular envelope intact. This allows you to distinguish true 4N single nuclei from binucleated cells (two 2N nuclei) using pulse-shape analysis (Violet Area vs. Width) on the flow cytometer.
+
+2. Internal Controls: Live Co-Fixation over Pre-Fixed Spikes
+The Variance Source: Adding commercially pre-fixed controls (like CEN) or spiking controls after target cells have been fixed guarantees that the target and control experience different chemical states. This destroys the mathematical relationship between their fluorescence intensities, causing severe batch-to-batch MFI drift.
+
+The Co-Fixation Solution: Spike a live reference population (such as standard cryopreserved human PBMCs) into your live target cell suspension before adding the fixative. Exposing both populations to the exact same reagent kinetics simultaneously locks the Target/Reference MFI ratio, providing a mathematically rigid anchor for automated gating pipelines.
+
+3. Salvaging Historical Data: Bare Nuclei Extraction
+The Method: Historical samples fixed in formaldehyde can be salvaged using a pepsin-HCl digestion protocol. This strips away the cytoplasm and cross-linked histones, leaving bare nuclei and freeing the minor groove for proper FxCycle Violet binding.
+
+The Trade-off: Pepsin digestion completely destroys the cellular membrane. Any binucleated cells will be physically separated into independent 2N nuclei. This permanently erases your ability to track cytokinesis failure or intact binucleated states in those historical batches.

@@ -75,6 +75,8 @@ library(knitr)
 library(tibble)
 library(dplyr)
 library(patchwork)
+
+source(file.path(project_root, "R", "metadata-utils.R"))
 ```
 
 ```{r config}
@@ -244,6 +246,40 @@ dataset_inventory <- dataset_tbl %>%
 if (nrow(dataset_inventory) <= 12 && ncol(dataset_inventory) <= 6) {
   kable(dataset_inventory)
 }
+```
+
+# Hypoxia Passaging Days
+
+```{r hypoxia-passaging-days}
+passaging_path <- file.path(data_root, "passaging.csv")
+passaging_tbl <- read.csv(passaging_path, stringsAsFactors = FALSE, check.names = FALSE)
+
+hypoxia_cfg <- dataset_tbl %>%
+  filter(dataset_id == "hypoxia-sum159") %>%
+  slice(1)
+
+hypoxia_passaging_day_tbl <- if (nrow(hypoxia_cfg) == 1) {
+  build_sum159_hypoxia_match_table(
+    sample_names = hypoxia_cfg$flow_files[[1]],
+    passaging_tbl = passaging_tbl
+  ) %>%
+    transmute(
+      sample_name,
+      latest_matching_id,
+      latest_match_date,
+      relative_day
+    ) %>%
+    distinct(sample_name, .keep_all = TRUE)
+} else {
+  tibble(
+    sample_name = character(),
+    latest_matching_id = character(),
+    latest_match_date = as.Date(character()),
+    relative_day = integer()
+  )
+}
+
+kable(hypoxia_passaging_day_tbl)
 ```
 
 # Helper Functions
@@ -451,6 +487,10 @@ build_or_load_dataset <- function(cfg) {
   }
 
   sample_metadata <- parse_sample_metadata(cfg$flow_files)
+  if (identical(cfg$dataset_id, "hypoxia-sum159") && nrow(hypoxia_passaging_day_tbl) > 0) {
+    sample_metadata <- sample_metadata %>%
+      left_join(hypoxia_passaging_day_tbl, by = "sample_name")
+  }
   write.csv(sample_metadata, cfg$sample_metadata_export_path, row.names = FALSE)
 
   input_tbl <- tibble(
