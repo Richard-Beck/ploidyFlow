@@ -1,0 +1,37 @@
+# stan_version_major = 2
+# stan_version_minor = 37
+# stan_version_patch = 0
+# model = hypoxia_peak_reduced_model
+# start_datetime = 2026-04-16 21:17:17 UTC
+# method = optimize
+#   optimize
+#     algorithm = lbfgs (Default)
+#       lbfgs
+#         init_alpha = 0.001 (Default)
+#         tol_obj = 1e-12 (Default)
+#         tol_rel_obj = 10000 (Default)
+#         tol_grad = 1e-08 (Default)
+#         tol_rel_grad = 1e+07 (Default)
+#         tol_param = 1e-08 (Default)
+#         history_size = 5 (Default)
+#     jacobian = false (Default)
+#     iter = 4000
+#     save_iterations = false (Default)
+# id = 1 (Default)
+# data
+#   file = C:/Users/4473331/AppData/Local/Temp/1/Rtmpkrm82O/standata-76984b2e2a36.json
+# init = C:/Users/4473331/AppData/Local/Temp/1/Rtmpkrm82O/init-76981ea7398_1.json
+# random
+#   seed = 123
+# output
+#   file = C:/Users/4473331/Documents/projects/023_ploidyFlow/dev/hypoxia_peak_reduced/output/hypoxia_peak_reduced_opt-1.csv
+#   diagnostic_file =  (Default)
+#   refresh = 100 (Default)
+#   sig_figs = 8 (Default)
+#   profile_file = C:/Users/4473331/Documents/projects/023_ploidyFlow/dev/hypoxia_peak_reduced/output/hypoxia_peak_reduced-profile-1.csv
+#   save_cmdstan_config = false (Default)
+# num_threads = 1 (Default)
+# stanc_version = stanc3 v2.37.0
+# stancflags = --name=hypoxia_peak_reduced_model
+lp__,alpha,beta,log_M_cen,log_R_2n,log_R_4n_over_2n,log_rho,log_phi_raw.1,log_phi_raw.2,log_phi_raw.3,log_phi_raw.4,log_phi_raw.5,log_phi_raw.6,log_phi_raw.7,log_phi_raw.8,log_phi_raw.9,log_phi_raw.10,sigma_cen,sigma_g1,p_4n,M_cen,R_2n,R_4n,rho,log_phi.1,log_phi.2,log_phi.3,log_phi.4,log_phi.5,log_phi.6,log_phi.7,log_phi.8,log_phi.9,log_phi.10,phi_date.1,phi_date.2,phi_date.3,phi_date.4,phi_date.5,phi_date.6,phi_date.7,phi_date.8,phi_date.9,phi_date.10,u.1,u.2,u.3,u.4,u.5,u.6,u.7,u.8,u.9,u.10,u.11,u.12,u.13,u.14,u.15,u.16,u.17,u.18,u.19,u.20,mu_cen.1,mu_cen.2,mu_cen.3,mu_cen.4,mu_cen.5,mu_cen.6,mu_cen.7,mu_cen.8,mu_cen.9,mu_cen.10,mu_cen.11,mu_cen.12,mu_cen.13,mu_cen.14,mu_cen.15,mu_cen.16,mu_cen.17,mu_cen.18,mu_cen.19,mu_cen.20,mu_g1_2n.1,mu_g1_2n.2,mu_g1_2n.3,mu_g1_2n.4,mu_g1_2n.5,mu_g1_2n.6,mu_g1_2n.7,mu_g1_2n.8,mu_g1_2n.9,mu_g1_2n.10,mu_g1_2n.11,mu_g1_2n.12,mu_g1_2n.13,mu_g1_2n.14,mu_g1_2n.15,mu_g1_2n.16,mu_g1_2n.17,mu_g1_2n.18,mu_g1_2n.19,mu_g1_2n.20,mu_g1_4n.1,mu_g1_4n.2,mu_g1_4n.3,mu_g1_4n.4,mu_g1_4n.5,mu_g1_4n.6,mu_g1_4n.7,mu_g1_4n.8,mu_g1_4n.9,mu_g1_4n.10,mu_g1_4n.11,mu_g1_4n.12,mu_g1_4n.13,mu_g1_4n.14,mu_g1_4n.15,mu_g1_4n.16,mu_g1_4n.17,mu_g1_4n.18,mu_g1_4n.19,mu_g1_4n.20,prob_4n.1,prob_4n.2,prob_4n.3,prob_4n.4,prob_4n.5,prob_4n.6,prob_4n.7,prob_4n.8,prob_4n.9,prob_4n.10,prob_4n.11,prob_4n.12,prob_4n.13,prob_4n.14,prob_4n.15,prob_4n.16,prob_4n.17,prob_4n.18,prob_4n.19,prob_4n.20,mu_g1_mixture.1,mu_g1_mixture.2,mu_g1_mixture.3,mu_g1_mixture.4,mu_g1_mixture.5,mu_g1_mixture.6,mu_g1_mixture.7,mu_g1_mixture.8,mu_g1_mixture.9,mu_g1_mixture.10,mu_g1_mixture.11,mu_g1_mixture.12,mu_g1_mixture.13,mu_g1_mixture.14,mu_g1_mixture.15,mu_g1_mixture.16,mu_g1_mixture.17,mu_g1_mixture.18,mu_g1_mixture.19,mu_g1_mixture.20
+-202.09876,-0.62992135,0.1399745,9.1424098,2.1767662,0.53602163,0.11187422,-0.097854105,-0.11847289,-0.11272198,0.02035978,-0.076299449,0.065470884,0.24970195,0.19495551,-0.0021333224,-0.12300637,0.33863968,0.022081508,0.59487581,9343.2531,8.8177455,15.071233,1.1183722,-0.097854105,-0.11847289,-0.11272198,0.02035978,-0.076299449,0.065470884,0.24970195,0.19495551,-0.0021333224,-0.12300637,0.90678119,0.8882759,0.89339901,1.0205685,0.92653871,1.0676617,1.2836428,1.2152569,0.99786895,0.88425803,2.0308382,1.9427674,2.132968,2.135426,2.150917,2.1134062,1.9650488,1.8911456,1.5515138,1.3449453,1.9806527,1.9547158,1.9182087,1.8983685,1.3487842,1.6081134,2.0126263,1.9866142,1.9660129,1.9444938,6260.524,6168.2645,6361.0161,6363.354,6378.0042,6342.2784,6192.1235,6111.5746,5681.4062,5358.8305,6208.6199,6181.1036,6141.5448,6119.6282,5365.3428,5760.8732,6241.8884,6214.8768,6193.1478,6170.126,46379.069,45745.135,46107.463,46123.144,46221.394,45981.745,45231.684,44685.581,47694.594,45158.78,47025.364,46832.086,53644.731,53467.07,56864.096,57533.382,50897.138,50692.959,44775.754,44621.377,79270.805,78187.287,78806.576,78833.379,79001.306,78591.701,77309.7,76376.306,81519.291,77185.093,80375.446,80045.097,91689.226,91385.568,97191.744,98335.683,86993.058,86644.077,76530.428,76266.568,2.2431658e-112,1,2.6984648e-124,2.6597274e-130,1,1,4.3486394e-116,1,1,1,5.5783049e-129,3.5253303e-128,2.1203407e-143,1,1,1,2.1340643e-143,1,1,1,46379.069,78187.287,46107.463,46123.144,79001.306,78591.701,45231.684,76376.306,81519.291,77185.093,47025.364,46832.086,53644.731,91385.568,97191.744,98335.683,50897.138,86644.077,76530.428,76266.568
