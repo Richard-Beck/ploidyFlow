@@ -1,0 +1,5 @@
+"ablation_name","stan_file","include_date_effect","include_x_ratio_effect","rho_fixed_one","free_parameter_count","n_samples","objective_lp","rmse_cen","rmse_g1","cor_counterfactual_vs_burden","mean_phi_date","sd_phi_date"
+"latent_u","hypoxia_peak_reduced_latent_u.stan",TRUE,TRUE,FALSE,40,20,-67.19457,2321.66375836464,1538.32948909234,-0.317434512377082,0.97871460717297,0.313770814032787
+"delta_dna","hypoxia_peak_reduced_delta_dna.stan",TRUE,TRUE,FALSE,40,20,-64.01342,2285.84468832073,1564.08793048573,0.422889771754144,0.972310330378346,0.114458627046523
+"adjacent_8n","hypoxia_peak_reduced_adjacent_8n.stan",TRUE,TRUE,FALSE,20,20,-385.63185,2249.87751406278,2250.01414507061,0.299202545969811,0.98134984832524,0.191896848156044
+"adjacent_8n_delta_dna","hypoxia_peak_reduced_adjacent_8n_delta_dna.stan",TRUE,TRUE,FALSE,41,20,-248.55861,2246.30159232403,2206.77652597344,0.463946425305099,0.972224643839953,0.11654659923489

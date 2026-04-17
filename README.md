@@ -9,11 +9,15 @@ related samples.
 The current focus is the anoxia dataset, where a shared CEN spike-in provides a
 useful internal reference across samples.
 
-## Current Checkpoint
+## Current Checkpoints
 
-This repository now has a preserved anoxia-only checkpoint under
-`results/2026-04-13-fixed-init-anoxia/`. That archive contains the three model
-variants currently worth comparing:
+This repository now has two main analysis entry points:
+
+- `results/2026-04-13-fixed-init-anoxia/`: preserved anoxia-only checkpoint
+- `dev/hypoxia_peak_reduced/`: active hypoxia development checkpoint
+
+The preserved anoxia archive contains the three model variants currently worth
+comparing:
 
 - `first_pass`: baseline model with globally fixed peak locations
 - `dye_ratio`: introduces a dye-ratio mechanism to explain coordinated peak
@@ -44,6 +48,19 @@ tumor peaks. The group-level effects in that model are more speculative than
 the core CEN-scaling idea, and a version without group effects is still a
 useful missing comparison.
 
+The active hypoxia development checkpoint is now asking a somewhat different
+question. The current working interpretation there is:
+
+- date-level peak shifts are real and remain necessary;
+- the burden proxy is not currently the main explanatory result;
+- a pure adjacent-state reinterpretation is too aggressive on its own;
+- the most interesting current hypothesis is that a small subset of ambiguous
+  samples, especially in the O2 lineage, may reflect adjacent higher ploidy
+  plus sample-specific DNA scaling.
+
+That hypoxia interpretation is still provisional and remains under `dev/`
+rather than being promoted into a preserved `results/` checkpoint.
+
 ## Experimental Caveats
 
 The 2N and 4N controls remain unresolved outliers in both the anoxia and
@@ -64,6 +81,10 @@ not yet represented.
   workflow
 - `workflow/fixed_init_anoxia_checkpoint.Rmd`: archived three-model comparison
   for the anoxia checkpoint
+- `dev/hypoxia_peak_reduced/README.md`: current hypoxia checkpoint notes and
+  interpretation
+- `dev/hypoxia_peak_reduced/report_hypoxia_peak_reduced.Rmd`: current hypoxia
+  checkpoint report
 - `R/run_fit.R`: canonical fit runner
 - `R/fit_specs.R`: canonical preserved fit specifications
 

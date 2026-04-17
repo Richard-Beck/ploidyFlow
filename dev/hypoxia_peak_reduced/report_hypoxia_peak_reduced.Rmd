@@ -1,0 +1,373 @@
+---
+title: "Hypoxia Peak Reduced Report"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(ggplot2)
+library(dplyr)
+library(scales)
+library(knitr)
+
+report_file <- knitr::current_input(dir = TRUE)
+report_dir <- if (nzchar(report_file)) dirname(report_file) else file.path("dev", "hypoxia_peak_reduced")
+out_dir <- file.path(report_dir, "output")
+project_root <- normalizePath(file.path(report_dir, "..", ".."), winslash = "/", mustWork = TRUE)
+
+summary_tbl <- read.csv(
+  file.path(out_dir, "sample_peak_summary.csv"),
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+input_tbl <- read.csv(
+  file.path(out_dir, "prepared_input_table.csv"),
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+ablation_tbl <- read.csv(
+  file.path(out_dir, "ablations", "ablation_comparison.csv"),
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+extension_tbl <- read.csv(
+  file.path(out_dir, "extensions", "extension_comparison.csv"),
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+karyotype_lookup_tbl <- read.csv(
+  file.path(out_dir, "karyotype_flow_lookup.csv"),
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+karyotype_ploidy_tbl <- read.csv(
+  file.path(out_dir, "karyotype_ploidy_summary.csv"),
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+adjacent_8n_tbl <- read.csv(
+  file.path(out_dir, "extensions", "adjacent_8n", "sample_peak_summary.csv"),
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+adjacent_8n_delta_tbl <- read.csv(
+  file.path(out_dir, "extensions", "adjacent_8n_delta_dna", "sample_peak_summary.csv"),
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+dna_vectors <- readRDS(
+  file.path(project_root, "processed_data", "hypoxia-sum159", "filtered_dna_area_vectors.rds")
+)$raw
+
+sample_order_tbl <- summary_tbl %>%
+  arrange(as.Date(latest_match_date), sample_name) %>%
+  transmute(
+    sample_name,
+    latest_match_date,
+    sample_label = sprintf(
+      "%s\n%s",
+      sub("^Sample_SUM159_", "", sample_name),
+      latest_match_date
+    )
+  )
+
+sample_levels <- sample_order_tbl$sample_name
+sample_label_map <- setNames(sample_order_tbl$sample_label, sample_order_tbl$sample_name)
+outlier_palette <- c("Primary outlier" = "#cb181d", "Not primary outlier" = "#2171b5")
+
+state_flip_tbl <- summary_tbl %>%
+  select(sample_name, condition, latest_match_date, relative_day, observed_g1_peak, baseline_state = assigned_state) %>%
+  inner_join(
+    adjacent_8n_tbl %>%
+      select(sample_name, adjacent_8n_state = assigned_state, adjacent_8n_counterfactual = phi1_counterfactual_peak),
+    by = "sample_name"
+  ) %>%
+  inner_join(
+    adjacent_8n_delta_tbl %>%
+      select(sample_name, adjacent_8n_delta_state = assigned_state, adjacent_8n_delta_counterfactual = phi1_counterfactual_peak),
+    by = "sample_name"
+  ) %>%
+  filter(
+    baseline_state != adjacent_8n_state |
+      baseline_state != adjacent_8n_delta_state
+  ) %>%
+  arrange(relative_day, sample_name)
+
+plot_burden_vs_peak <- function(data, y_var, y_label, title) {
+  ggplot(data, aes(x = ratio_above_below, y = .data[[y_var]])) +
+    geom_point(aes(color = latest_match_date), size = 2.4, alpha = 0.9) +
+    labs(
+      title = title,
+      x = "Burden proxy: ratio above / below",
+      y = y_label,
+      color = "Sample date"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(panel.grid.minor = element_blank())
+}
+
+plot_peak_ratio_by_sample <- function(summary_tbl, input_tbl) {
+  ratio_tbl <- input_tbl %>%
+    select(sample_name, tumor_peak_1, tumor_peak_2) %>%
+    inner_join(summary_tbl %>% select(sample_name, is_primary_outlier), by = "sample_name") %>%
+    filter(!is_primary_outlier) %>%
+    inner_join(sample_order_tbl, by = "sample_name") %>%
+    mutate(
+      sample_name = factor(sample_name, levels = sample_levels),
+      secondary_primary_ratio = tumor_peak_2 / tumor_peak_1
+    ) %>%
+    filter(is.finite(secondary_primary_ratio))
+
+  ggplot(ratio_tbl, aes(x = sample_name, y = secondary_primary_ratio, fill = latest_match_date)) +
+    geom_col(width = 0.72, color = "white", linewidth = 0.2) +
+    geom_hline(yintercept = 2, linetype = "dashed", color = "grey35", linewidth = 0.4) +
+    coord_flip() +
+    scale_x_discrete(labels = sample_label_map) +
+    labs(
+      title = "Secondary-to-primary peak ratio by sample",
+      subtitle = "Primary outliers are excluded. Dashed line marks a ratio of 2.",
+      x = NULL,
+      y = "Observed secondary / primary peak ratio",
+      fill = "Sample date"
+    ) +
+    theme_bw(base_size = 9) +
+    theme(
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom"
+    )
+}
+
+build_histogram_plot_data <- function(summary_tbl, input_tbl, dna_vectors) {
+  hist_tbl <- bind_rows(lapply(names(dna_vectors), function(sample_name) {
+    tibble(
+      sample_name = sample_name,
+      dna_a = dna_vectors[[sample_name]]
+    )
+  })) %>%
+    filter(is.finite(dna_a)) %>%
+    inner_join(sample_order_tbl, by = "sample_name") %>%
+    mutate(sample_name = factor(sample_name, levels = sample_levels))
+
+  base_peak_tbl <- input_tbl %>%
+    select(sample_name, cen_peak, tumor_peak_1, tumor_peak_2) %>%
+    inner_join(summary_tbl %>% select(sample_name, is_primary_outlier), by = "sample_name") %>%
+    inner_join(sample_order_tbl, by = "sample_name") %>%
+    mutate(
+      sample_name = factor(sample_name, levels = sample_levels),
+      outlier_status = if_else(is_primary_outlier, "Primary outlier", "Not primary outlier")
+    ) %>%
+    select(sample_name, sample_label, outlier_status, cen_peak, tumor_peak_1, tumor_peak_2)
+
+  peak_tbl <- bind_rows(
+    base_peak_tbl %>%
+      transmute(sample_name, sample_label, outlier_status, peak_type = "CEN peak", peak_location = cen_peak),
+    base_peak_tbl %>%
+      transmute(sample_name, sample_label, outlier_status, peak_type = "Tumor peak 1", peak_location = tumor_peak_1),
+    base_peak_tbl %>%
+      transmute(sample_name, sample_label, outlier_status, peak_type = "Tumor peak 2", peak_location = tumor_peak_2)
+  ) %>%
+    filter(is.finite(peak_location))
+
+  list(hist_tbl = hist_tbl, peak_tbl = peak_tbl)
+}
+
+plot_sample_dna_histograms <- function(summary_tbl, input_tbl, dna_vectors) {
+  plot_parts <- build_histogram_plot_data(summary_tbl, input_tbl, dna_vectors)
+  hist_tbl <- plot_parts$hist_tbl
+  peak_tbl <- plot_parts$peak_tbl
+  binwidth <- max(1000, diff(range(hist_tbl$dna_a, na.rm = TRUE)) / 90)
+
+  ggplot(hist_tbl, aes(x = dna_a)) +
+    geom_histogram(binwidth = binwidth, fill = "grey82", color = "white", linewidth = 0.15) +
+    geom_vline(
+      aes(xintercept = peak_location, color = outlier_status, linetype = peak_type),
+      data = peak_tbl,
+      linewidth = 0.5,
+      alpha = 0.9,
+      show.legend = TRUE
+    ) +
+    facet_wrap(~ sample_name, scales = "free_y", ncol = 4, labeller = as_labeller(sample_label_map)) +
+    scale_color_manual(values = outlier_palette) +
+    scale_linetype_manual(
+      values = c(
+        "CEN peak" = "dotted",
+        "Tumor peak 1" = "solid",
+        "Tumor peak 2" = "longdash"
+      )
+    ) +
+    scale_x_continuous(labels = label_comma()) +
+    labs(
+      title = "Per-sample raw DNA-A histograms with peak annotations",
+      subtitle = "Peak markers are colored by each sample's primary-outlier status from the peak summary table.",
+      x = "Raw DNA-A signal",
+      y = "Cell count",
+      color = NULL,
+      linetype = NULL
+    ) +
+    theme_bw(base_size = 9) +
+    theme(
+      panel.grid.minor = element_blank(),
+      strip.text = element_text(size = 8),
+      legend.position = "bottom"
+    )
+}
+```
+
+# Data
+
+This report uses the current checkpoint outputs under `output/`, including the
+baseline sample summary, ablation comparison, extension comparison, and the
+karyotype lookup tables, plus the raw DNA-A vectors in
+`processed_data/hypoxia-sum159/filtered_dna_area_vectors.rds`.
+
+# Current Takeaway
+
+The current checkpoint interpretation is narrower than the earlier
+`phi = 1`-focused story.
+
+The strongest ablation result is that the date effect is real and needed:
+removing it causes a large degradation in lower-peak fit. By contrast, removing
+the burden effect changes the fit much less, and fixing `rho = 1` is nearly
+irrelevant at this checkpoint.
+
+Among the extensions, a pure adjacent-state reinterpretation appears too
+aggressive because it relabels some late 4N samples as 2N. The combined
+`adjacent_8n_delta_dna` model is more plausible because it keeps the late 4N
+samples as 4N while reassigning only a smaller subset of ambiguous O2 samples.
+
+# Ablations
+
+```{r ablation-table}
+ablation_tbl %>%
+  mutate(
+    objective_lp = round(objective_lp, 2),
+    rmse_cen = round(rmse_cen, 1),
+    rmse_g1 = round(rmse_g1, 1),
+    cor_counterfactual_vs_burden = round(cor_counterfactual_vs_burden, 3),
+    mean_phi_date = round(mean_phi_date, 3),
+    sd_phi_date = round(sd_phi_date, 3)
+  ) %>%
+  arrange(desc(include_date_effect), desc(include_x_ratio_effect), rho_fixed_one) %>%
+  kable()
+```
+
+# Extensions
+
+```{r extension-table}
+extension_tbl %>%
+  mutate(
+    objective_lp = round(objective_lp, 2),
+    rmse_cen = round(rmse_cen, 1),
+    rmse_g1 = round(rmse_g1, 1),
+    cor_counterfactual_vs_burden = round(cor_counterfactual_vs_burden, 3),
+    mean_phi_date = round(mean_phi_date, 3),
+    sd_phi_date = round(sd_phi_date, 3)
+  ) %>%
+  kable()
+```
+
+# State Reassignments
+
+The table below isolates the samples whose lower-peak state assignment changes
+relative to the baseline model.
+
+```{r state-flips}
+state_flip_tbl %>%
+  mutate(
+    observed_g1_peak = round(observed_g1_peak, 1),
+    adjacent_8n_counterfactual = round(adjacent_8n_counterfactual, 1),
+    adjacent_8n_delta_counterfactual = round(adjacent_8n_delta_counterfactual, 1)
+  ) %>%
+  kable()
+```
+
+This is the main reason the combined model is easier to defend than
+`adjacent_8n` alone: the plain adjacent-state model also relabels the late
+`4N_O1_A22` and `4N_O2_A22` samples as 2N, whereas the combined model leaves
+those late 4N samples alone and only flips the two more ambiguous O2 samples
+(`2N_O2_A18` and `2N_O2_A23`).
+
+# Karyotype Link
+
+These karyotype summaries do not prove the flow-state interpretation, but they
+do make the O2 ambiguity biologically more interesting rather than purely a
+fitting artifact.
+
+```{r karyotype-summary}
+karyotype_ploidy_tbl %>%
+  mutate(
+    mean_dna_ploidy_using_supplied_unidentified = round(mean_dna_ploidy_using_supplied_unidentified, 3),
+    sd_dna_ploidy_using_supplied_unidentified = round(sd_dna_ploidy_using_supplied_unidentified, 3),
+    mean_dna_ploidy_using_average_unidentified = round(mean_dna_ploidy_using_average_unidentified, 3),
+    sd_dna_ploidy_using_average_unidentified = round(sd_dna_ploidy_using_average_unidentified, 3)
+  ) %>%
+  kable()
+```
+
+```{r karyotype-lookup}
+karyotype_lookup_tbl %>%
+  select(
+    karyo_id,
+    flow_sample_name,
+    flow_condition,
+    mapping_note,
+    mean_dna_ploidy_using_supplied_unidentified
+  ) %>%
+  mutate(mean_dna_ploidy_using_supplied_unidentified = round(mean_dna_ploidy_using_supplied_unidentified, 3)) %>%
+  kable()
+```
+
+# Peak Histograms
+
+```{r raw-dna-histograms-with-peaks, fig.width=14, fig.height=12}
+plot_sample_dna_histograms(summary_tbl, input_tbl, dna_vectors)
+```
+
+# Peak Ratio
+
+```{r peak-ratio-by-sample, fig.width=10, fig.height=7}
+plot_peak_ratio_by_sample(summary_tbl, input_tbl)
+```
+
+# Burden Proxy Plots
+
+```{r observed-g1-vs-burden, fig.width=7, fig.height=4.5}
+plot_burden_vs_peak(
+  summary_tbl,
+  y_var = "observed_g1_peak",
+  y_label = "Observed G0/G1 peak",
+  title = "Observed G0/G1 peak vs burden proxy"
+)
+```
+
+```{r observed-cen-vs-burden, fig.width=7, fig.height=4.5}
+plot_burden_vs_peak(
+  summary_tbl,
+  y_var = "cen_peak",
+  y_label = "Observed CEN peak",
+  title = "Observed CEN peak vs burden proxy"
+)
+```
+
+```{r counterfactual-g1-vs-burden, fig.width=7, fig.height=4.5}
+plot_burden_vs_peak(
+  summary_tbl,
+  y_var = "phi1_counterfactual_peak",
+  y_label = "Counterfactual G0/G1 peak",
+  title = "Counterfactual G0/G1 peak vs burden proxy"
+)
+```
+
+The burden plots remain useful descriptively, but they are no longer the main
+interpretive result of this checkpoint. The current comparison tables argue more
+strongly for a persistent date effect and for a narrower adjacent-state-plus-
+`delta_dna` explanation in a subset of ambiguous samples.

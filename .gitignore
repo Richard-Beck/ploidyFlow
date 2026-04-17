@@ -8,3 +8,6 @@ workflow/cache/
 workflow/workflow/
 workflow/tmp_*.md
 tmp/
+dev/hypoxia_peak_reduced/output/**/nuts/
+dev/hypoxia_peak_reduced/output/extensions_test/
+dev/hypoxia_peak_reduced/output/**/*_opt-*.csv

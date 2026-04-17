@@ -1,0 +1,5 @@
+"ablation_name","stan_file","include_date_effect","include_x_ratio_effect","rho_fixed_one","free_parameter_count","n_samples","objective_lp","rmse_cen","rmse_g1","cor_counterfactual_vs_burden","mean_phi_date","sd_phi_date"
+"baseline","hypoxia_peak_reduced.stan",TRUE,TRUE,FALSE,19,20,-202.09876,2285.50415145139,1568.20068238908,0.222895939190585,0.972307762732465,0.11449767442305
+"no_date_effect","hypoxia_peak_reduced_no_date.stan",FALSE,TRUE,FALSE,9,20,-229.70651,2444.7241946422,6821.79448925387,0.422876323373805,1,0
+"no_x_ratio_effect","hypoxia_peak_reduced_no_xratio.stan",TRUE,FALSE,FALSE,18,20,-203.50976,2443.11123084121,1573.1140192412,0.422879447082254,0.981518843455242,0.0832687022531084
+"rho_fixed_one","hypoxia_peak_reduced_rho1.stan",TRUE,TRUE,TRUE,18,20,-202.1411,2300.3246142853,1564.88763153739,0.224353836062311,0.972339215734643,0.114248662253017

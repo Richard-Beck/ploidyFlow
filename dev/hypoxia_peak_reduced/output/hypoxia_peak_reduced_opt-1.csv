@@ -2,7 +2,7 @@
 # stan_version_minor = 37
 # stan_version_patch = 0
 # model = hypoxia_peak_reduced_model
-# start_datetime = 2026-04-16 21:17:17 UTC
+# start_datetime = 2026-04-17 14:46:34 UTC
 # method = optimize
 #   optimize
 #     algorithm = lbfgs (Default)
@@ -19,8 +19,8 @@
 #     save_iterations = false (Default)
 # id = 1 (Default)
 # data
-#   file = C:/Users/4473331/AppData/Local/Temp/1/Rtmpkrm82O/standata-76984b2e2a36.json
-# init = C:/Users/4473331/AppData/Local/Temp/1/Rtmpkrm82O/init-76981ea7398_1.json
+#   file = C:/Users/4473331/AppData/Local/Temp/1/RtmpkZw8eL/standata-85bc26216fbd.json
+# init = C:/Users/4473331/AppData/Local/Temp/1/RtmpkZw8eL/init-85bc4853cfe_1.json
 # random
 #   seed = 123
 # output

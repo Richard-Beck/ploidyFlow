@@ -2,12 +2,25 @@ source("dev/hypoxia_peak_reduced/hypoxia_peak_reduced_helpers.R")
 
 project_root <- normalizePath(if (length(commandArgs(trailingOnly = TRUE)) >= 1) commandArgs(trailingOnly = TRUE)[[1]] else ".", winslash = "/", mustWork = TRUE)
 out_dir <- file.path(project_root, "dev", "hypoxia_peak_reduced", "output")
+report_path <- file.path(project_root, "dev", "hypoxia_peak_reduced", "report_hypoxia_peak_reduced.Rmd")
 
-fit_tbl <- read.csv(file.path(out_dir, "sample_predictions.csv"), stringsAsFactors = FALSE, check.names = FALSE)
-summary_tbl <- build_sample_peak_summary(fit_tbl)
+summary_tbl <- render_fit_outputs(out_dir)
 
-write.csv(summary_tbl, file.path(out_dir, "sample_peak_summary.csv"), row.names = FALSE)
-ggsave(file.path(out_dir, "phi_counterfactual.png"), plot_phi_counterfactual(fit_tbl), width = 12, height = 8, dpi = 220)
+if (rmarkdown::pandoc_available("1.12.3")) {
+  rmarkdown::render(
+    report_path,
+    output_dir = dirname(report_path),
+    intermediates_dir = dirname(report_path),
+    envir = new.env(parent = globalenv())
+  )
+} else {
+  knitr::knit(
+    report_path,
+    output = file.path(dirname(report_path), "report_hypoxia_peak_reduced.md"),
+    envir = new.env(parent = globalenv())
+  )
+  cat("Pandoc was not available; knitted markdown report instead of HTML.\n")
+}
 
 cat("Saved checkpoint outputs under:", out_dir, "\n")
 print(summary_tbl)
