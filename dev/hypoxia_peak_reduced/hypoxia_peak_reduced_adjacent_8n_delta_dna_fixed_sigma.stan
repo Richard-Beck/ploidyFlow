@@ -7,7 +7,7 @@ data {
   vector<lower=0>[N] y_peak_lower;
   array[N] int<lower=0, upper=1> has_upper_peak;
   vector<lower=0>[N] y_peak_upper;
-  real<lower=0> sigma_delta_dna_prior_scale;
+  real<lower=0.001, upper=0.5> sigma_delta_dna_fixed;
 }
 
 parameters {
@@ -20,7 +20,6 @@ parameters {
   real log_rho;
   vector[N_date] log_phi_raw;
   vector[N] delta_dna;
-  real<lower=0.001, upper=0.5> sigma_delta_dna;
   real<lower=0.01, upper=1> sigma_cen;
   real<lower=0.01, upper=1> sigma_g1;
   real<lower=0.01, upper=0.99> p_4n;
@@ -63,8 +62,7 @@ model {
   log_R_8n_over_4n ~ normal(log(2), 0.2);
   log_rho ~ normal(0, 0.5);
   log_phi_raw ~ normal(0, 0.35);
-  sigma_delta_dna ~ normal(0, sigma_delta_dna_prior_scale);
-  delta_dna ~ normal(0, sigma_delta_dna);
+  delta_dna ~ normal(0, sigma_delta_dna_fixed);
   sigma_cen ~ normal(0, 0.15);
   sigma_g1 ~ normal(0, 0.15);
   p_4n ~ beta(1.5, 1.5);

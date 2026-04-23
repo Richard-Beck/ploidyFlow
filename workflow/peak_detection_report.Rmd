@@ -1,0 +1,283 @@
+---
+title: "Peak Detection Across Project Datasets"
+knit: !expr function(input_file, encoding) rmarkdown::render(input_file, encoding = encoding, output_dir = dirname(input_file), intermediates_dir = dirname(input_file), envir = new.env(parent = globalenv()))
+output:
+  html_document:
+    toc: true
+    toc_float: true
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r setup, include=FALSE}
+input_path <- knitr::current_input(dir = TRUE)
+workflow_dir <- if (length(input_path) == 0) {
+  normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+} else {
+  normalizePath(dirname(input_path), winslash = "/", mustWork = TRUE)
+}
+project_root <- normalizePath(file.path(workflow_dir, ".."), winslash = "/", mustWork = TRUE)
+if (!dir.exists(file.path(project_root, "data")) && dir.exists(file.path(getwd(), "data"))) {
+  project_root <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+}
+knitr::opts_knit$set(root.dir = workflow_dir)
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  out.width = "100%"
+)
+```
+
+# Goal
+
+This report applies the promoted density-based peak detection workflow to each
+project dataset under `data/`, using the gated DNA vectors exported under
+`processed_data/`. For every dataset it detects one below-threshold reference
+peak, up to two above-threshold peaks, and flags the primary outlier sample
+using the same two-peak ratio rule that was developed in `dev/`.
+
+```{r libraries}
+library(ggplot2)
+library(knitr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(scales)
+
+source(file.path(project_root, "R", "peak_detection.R"))
+```
+
+```{r config}
+data_root <- file.path(project_root, "data")
+processed_root <- file.path(project_root, "processed_data")
+
+threshold <- 12000
+tumor_peak_min_separation <- 35000
+tumor_peak_min_prominence <- 0
+max_hist_signal <- 200000
+
+sanitize_dataset_id <- function(x) {
+  x <- tolower(gsub("[^A-Za-z0-9]+", "-", x))
+  x <- gsub("(^-+|-+$)", "", x)
+  if (!nzchar(x)) {
+    stop("Could not derive a dataset id from the supplied name.")
+  }
+  x
+}
+
+discover_dataset_dirs <- function(root_path) {
+  dirs <- list.dirs(root_path, recursive = FALSE, full.names = TRUE)
+  dirs <- dirs[!startsWith(basename(dirs), ".")]
+  dirs <- dirs[basename(dirs) != "cache"]
+  dirs <- dirs[basename(dirs) != "__MACOSX"]
+  sort(normalizePath(dirs, winslash = "/", mustWork = TRUE))
+}
+
+load_dataset_peak_bundle <- function(dataset_dir) {
+  dataset_name <- basename(dataset_dir)
+  dataset_id <- sanitize_dataset_id(dataset_name)
+  cache_dir <- file.path(processed_root, dataset_id)
+  dna_path <- file.path(cache_dir, "filtered_dna_area_vectors.rds")
+  metadata_path <- file.path(cache_dir, "sample_metadata.csv")
+
+  if (!file.exists(dna_path) || !file.exists(metadata_path)) {
+    cache_parts <- build_peak_detection_cache(
+      dataset_dir = dataset_dir,
+      cache_dir = cache_dir
+    )
+    dna_vectors <- cache_parts$dna_vectors
+    metadata_tbl <- cache_parts$metadata_tbl
+    cache_source <- "bootstrap_from_raw_fcs"
+  } else {
+    dna_vectors <- readRDS(dna_path)
+    metadata_tbl <- read.csv(metadata_path, stringsAsFactors = FALSE, check.names = FALSE)
+    cache_source <- "existing_processed_data"
+  }
+
+  peak_tbl <- detect_dataset_peaks(
+    dna_vectors = dna_vectors$raw,
+    sample_metadata = metadata_tbl,
+    dataset_id = dataset_id,
+    dataset_name = dataset_name,
+    threshold = threshold,
+    tumor_peak_min_separation = tumor_peak_min_separation,
+    tumor_peak_min_prominence = tumor_peak_min_prominence
+  )
+
+  summary_path <- file.path(cache_dir, "peak_detection_summary.csv")
+  write.csv(peak_tbl, summary_path, row.names = FALSE)
+
+  plot_parts <- build_peak_plot_data(
+    peak_tbl = peak_tbl,
+    dna_vectors = dna_vectors$raw,
+    max_signal = max_hist_signal
+  )
+
+  list(
+    dataset_name = dataset_name,
+    dataset_id = dataset_id,
+    cache_dir = cache_dir,
+    summary_path = summary_path,
+    cache_source = cache_source,
+    peak_tbl = peak_tbl,
+    overview_tbl = build_peak_detection_overview(peak_tbl),
+    hist_tbl = plot_parts$hist_tbl,
+    peak_line_tbl = plot_parts$peak_line_tbl
+  )
+}
+
+dataset_dirs <- discover_dataset_dirs(data_root)
+dataset_results <- lapply(dataset_dirs, load_dataset_peak_bundle)
+names(dataset_results) <- vapply(dataset_results, `[[`, character(1), "dataset_id")
+
+overview_tbl <- bind_rows(lapply(dataset_results, `[[`, "overview_tbl"))
+summary_manifest_tbl <- tibble(
+  dataset_name = vapply(dataset_results, `[[`, character(1), "dataset_name"),
+  dataset_id = vapply(dataset_results, `[[`, character(1), "dataset_id"),
+  cache_source = vapply(dataset_results, `[[`, character(1), "cache_source"),
+  summary_csv = vapply(dataset_results, `[[`, character(1), "summary_path")
+)
+```
+
+# Dataset Overview
+
+```{r dataset-overview}
+kable(overview_tbl %>%
+  mutate(
+    median_ratio_above_below = round(median_ratio_above_below, 3),
+    median_count_ratio_above_below = round(median_count_ratio_above_below, 3)
+  ))
+```
+
+# Saved Outputs
+
+```{r saved-outputs}
+kable(summary_manifest_tbl)
+```
+
+# Per-Dataset Results
+
+```{r dataset-sections, results='asis', fig.width=12, fig.height=18}
+plot_dataset_histograms <- function(res) {
+  if (!nrow(res$hist_tbl)) {
+    return(
+      ggplot() +
+        annotate("text", x = 1, y = 1, label = "No histogram data available.") +
+        theme_void()
+    )
+  }
+
+  ggplot(res$hist_tbl, aes(x = bin_center, y = count)) +
+    geom_col(width = diff(range(res$hist_tbl$bin_center, na.rm = TRUE)) / 256, fill = "#9ecae1", color = NA) +
+    geom_vline(
+      data = res$peak_line_tbl,
+      aes(xintercept = peak_location, color = outlier_status, linetype = peak_type),
+      linewidth = 0.35,
+      alpha = 0.9,
+      show.legend = TRUE
+    ) +
+    facet_wrap(~ sample_id, scales = "free_y", ncol = 3) +
+    scale_color_manual(values = c("Primary outlier" = "#cb181d", "Not primary outlier" = "#2171b5")) +
+    scale_linetype_manual(values = c("CEN peak" = "dotted", "Tumor peak 1" = "solid", "Tumor peak 2" = "longdash")) +
+    labs(
+      title = paste(res$dataset_name, "raw DNA histograms with peak annotations"),
+      subtitle = "Colored lines show the dev-methodology peak calls and the primary outlier flag.",
+      x = "Raw DNA area",
+      y = "Event count",
+      color = NULL,
+      linetype = NULL
+    ) +
+    theme_bw() +
+    theme(
+      strip.text = element_text(size = 7),
+      legend.position = "bottom"
+    )
+}
+
+plot_peak_locations <- function(res) {
+  plot_tbl <- bind_rows(
+    res$peak_tbl %>%
+      transmute(
+        sample_id,
+        peak_type = "CEN peak",
+        peak_location = cen_peak,
+        is_primary_outlier
+      ),
+    res$peak_tbl %>%
+      transmute(
+        sample_id,
+        peak_type = "Tumor peak 1",
+        peak_location = tumor_peak_1,
+        is_primary_outlier
+      ),
+    res$peak_tbl %>%
+      transmute(
+        sample_id,
+        peak_type = "Tumor peak 2",
+        peak_location = tumor_peak_2,
+        is_primary_outlier
+      )
+  ) %>%
+    filter(is.finite(peak_location))
+
+  if (!nrow(plot_tbl)) {
+    return(
+      ggplot() +
+        annotate("text", x = 1, y = 1, label = "No peak locations are available.") +
+        theme_void()
+    )
+  }
+
+  sample_levels <- sort(unique(res$peak_tbl$sample_id))
+
+  ggplot(
+    plot_tbl,
+    aes(
+      x = factor(sample_id, levels = sample_levels),
+      y = peak_location,
+      color = peak_type,
+      shape = is_primary_outlier
+    )
+  ) +
+    geom_point(size = 2.3, alpha = 0.9) +
+    coord_flip() +
+    scale_color_manual(
+      values = c(
+        "CEN peak" = "#1b9e77",
+        "Tumor peak 1" = "#d95f02",
+        "Tumor peak 2" = "#7570b3"
+      )
+    ) +
+    scale_shape_manual(
+      values = c("TRUE" = 17, "FALSE" = 16),
+      labels = c("FALSE" = "Not primary outlier", "TRUE" = "Primary outlier")
+    ) +
+    labs(
+      title = paste(res$dataset_name, "peak locations by sample"),
+      x = NULL,
+      y = "Peak location",
+      color = NULL,
+      shape = NULL
+    ) +
+    theme_bw() +
+    theme(legend.position = "bottom")
+}
+
+for (res in dataset_results) {
+  cat(sprintf("## %s\n\n", res$dataset_name))
+  cat(sprintf("Peak input source: `%s`  \n", res$cache_source))
+  cat(sprintf("Cached summary: `%s`\n\n", gsub("\\\\", "/", res$summary_path)))
+  cat(sprintf(
+    "Samples: %d. Two-peak calls: %d. Primary outliers: %d.\n\n",
+    nrow(res$peak_tbl),
+    sum(is.finite(res$peak_tbl$tumor_peak_1) & is.finite(res$peak_tbl$tumor_peak_2)),
+    sum(res$peak_tbl$is_primary_outlier, na.rm = TRUE)
+  ))
+  cat("\n")
+  print(plot_dataset_histograms(res))
+  cat("\n")
+  print(plot_peak_locations(res))
+  cat("\n\n")
+}
+```

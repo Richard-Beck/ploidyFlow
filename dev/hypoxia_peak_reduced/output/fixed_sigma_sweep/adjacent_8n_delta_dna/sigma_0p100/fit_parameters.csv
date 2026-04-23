@@ -1,0 +1,2 @@
+"ablation_name","alpha","beta","M_cen","R_2n","R_4n","R_8n","rho","sigma_u","sigma_delta_dna","sigma_cen","sigma_g1","p_4n","sigma_delta_dna_fixed","objective_lp"
+"adjacent_8n_delta_dna",-0.7761903,0.0098556108,8887.5757741571,8.81192484330037,15.8957212621176,28.1209229995257,0.887857332940842,NA,NA,0.35765133,0.010523361,0.21428573,0.1,-353.09744

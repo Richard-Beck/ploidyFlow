@@ -1,6 +1,7 @@
 library(ggplot2)
 library(dplyr)
 library(tibble)
+library(tidyr)
 
 interpolate_half_height_crossing <- function(x_left, y_left, x_right, y_right, target_y) {
   if (!all(is.finite(c(x_left, y_left, x_right, y_right, target_y)))) {
@@ -364,6 +365,11 @@ add_two_peak_model_columns <- function(input_tbl) {
 
 build_stan_data_for_spec <- function(prepared, spec) {
   input_tbl <- prepared$input_tbl
+  sigma_delta_dna_prior_scale <- if (isTRUE(spec$sample_delta_dna) && !is.null(spec$delta_dna_prior_scale)) {
+    spec$delta_dna_prior_scale
+  } else {
+    0.1
+  }
 
   if (isTRUE(spec$two_peak_adjacent_8n)) {
     peak_upper <- input_tbl$modeled_peak_2
@@ -375,10 +381,15 @@ build_stan_data_for_spec <- function(prepared, spec) {
       y_cen = input_tbl$cen_peak,
       y_peak_lower = input_tbl$modeled_peak_1,
       has_upper_peak = as.integer(is.finite(peak_upper)),
-      y_peak_upper = ifelse(is.finite(peak_upper), peak_upper, input_tbl$modeled_peak_1)
+      y_peak_upper = ifelse(is.finite(peak_upper), peak_upper, input_tbl$modeled_peak_1),
+      sigma_delta_dna_prior_scale = sigma_delta_dna_prior_scale
     )
   } else {
-    prepared$stan_data
+    stan_data <- prepared$stan_data
+    if (isTRUE(spec$sample_delta_dna)) {
+      stan_data$sigma_delta_dna_prior_scale <- sigma_delta_dna_prior_scale
+    }
+    stan_data
   }
 }
 
@@ -1376,5 +1387,1098 @@ build_karyotype_flow_lookup <- function(project_root) {
   list(
     lookup_tbl = lookup_tbl,
     ploidy_summary = ploidy_summary
+  )
+}
+
+safe_quantile <- function(x, probs) {
+  x <- x[is.finite(x)]
+  if (!length(x)) {
+    return(rep(NA_real_, length(probs)))
+  }
+  as.numeric(stats::quantile(x, probs = probs, na.rm = TRUE, names = FALSE))
+}
+
+trapz_integral <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y)
+  x <- x[ok]
+  y <- y[ok]
+  if (length(x) < 2) {
+    return(NA_real_)
+  }
+  sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2)
+}
+
+map_dna_to_ploidy_counterfactual <- function(x, anchor_2n, anchor_4n, anchor_8n) {
+  if (!all(is.finite(c(anchor_2n, anchor_4n, anchor_8n))) || !(anchor_2n < anchor_4n && anchor_4n < anchor_8n)) {
+    return(rep(NA_real_, length(x)))
+  }
+
+  out <- numeric(length(x))
+  idx_mid <- x <= anchor_4n
+  out[idx_mid] <- 2 + 2 * (x[idx_mid] - anchor_2n) / (anchor_4n - anchor_2n)
+  out[!idx_mid] <- 4 + 4 * (x[!idx_mid] - anchor_4n) / (anchor_8n - anchor_4n)
+  out
+}
+
+select_evenly_spaced_draw_indices <- function(n_draw, max_draws) {
+  max_draws <- as.integer(max_draws[[1]])
+  if (!is.finite(max_draws) || max_draws < 1) {
+    stop("`max_draws` must be a positive integer.")
+  }
+  if (max_draws >= n_draw) {
+    return(seq_len(n_draw))
+  }
+
+  idx <- unique(as.integer(round(seq(1, n_draw, length.out = max_draws))))
+  if (length(idx) < max_draws) {
+    remaining <- setdiff(seq_len(n_draw), idx)
+    idx <- sort(c(idx, remaining[seq_len(min(length(remaining), max_draws - length(idx)))]))
+  }
+  idx[seq_len(min(length(idx), max_draws))]
+}
+
+infer_histogram_bin_count <- function(values, min_bins = 60, max_bins = 160) {
+  values <- values[is.finite(values)]
+  if (length(values) < 2) {
+    return(min_bins)
+  }
+  fd_bins <- suppressWarnings(grDevices::nclass.FD(values))
+  if (!is.finite(fd_bins) || fd_bins < 1) {
+    fd_bins <- ceiling(sqrt(length(values)))
+  }
+  as.integer(max(min_bins, min(max_bins, fd_bins)))
+}
+
+build_flow_event_histogram <- function(values, threshold, min_bins = 60, max_bins = 160) {
+  x <- values[is.finite(values) & values > threshold]
+  if (length(x) < 50 || length(unique(x)) < 2) {
+    stop("Not enough above-threshold events to build a histogram.")
+  }
+
+  n_bins <- infer_histogram_bin_count(x, min_bins = min_bins, max_bins = max_bins)
+  hist_obj <- graphics::hist(x, breaks = n_bins, plot = FALSE, include.lowest = TRUE, right = FALSE)
+  binwidth <- diff(hist_obj$breaks)
+  density <- hist_obj$counts / sum(hist_obj$counts) / binwidth
+
+  tibble(
+    bin_left = head(hist_obj$breaks, -1),
+    bin_right = tail(hist_obj$breaks, -1),
+    bin_mid = hist_obj$mids,
+    bin_width = binwidth,
+    count = hist_obj$counts,
+    density = density
+  )
+}
+
+build_flow_anchor_draws <- function(draws_matrix, prepared, spec) {
+  input_tbl <- prepared$input_tbl
+  n_sample <- nrow(input_tbl)
+  n_draw <- nrow(draws_matrix)
+
+  alpha <- draws_matrix[, "alpha"]
+  beta <- if (isTRUE(spec$include_x_ratio_effect) && "beta" %in% colnames(draws_matrix)) draws_matrix[, "beta"] else rep(0, n_draw)
+  log_M_cen <- draws_matrix[, "log_M_cen"]
+  log_R_2n <- draws_matrix[, "log_R_2n"]
+  log_R_4n_over_2n <- draws_matrix[, "log_R_4n_over_2n"]
+  log_R_8n_over_4n <- if (isTRUE(spec$two_peak_adjacent_8n) && "log_R_8n_over_4n" %in% colnames(draws_matrix)) draws_matrix[, "log_R_8n_over_4n"] else rep(NA_real_, n_draw)
+  log_rho <- if (!isTRUE(spec$rho_fixed_one) && "log_rho" %in% colnames(draws_matrix)) draws_matrix[, "log_rho"] else rep(0, n_draw)
+  prob_4n <- extract_indexed_draw_matrix(draws_matrix, "prob_4n", n_sample)
+  delta_dna <- if (isTRUE(spec$sample_delta_dna)) extract_indexed_draw_matrix(draws_matrix, "delta_dna", n_sample) else matrix(0, nrow = n_draw, ncol = n_sample)
+  anchor_2n <- extract_indexed_draw_matrix(draws_matrix, "mu_peak_2n", n_sample)
+  anchor_4n <- extract_indexed_draw_matrix(draws_matrix, "mu_peak_4n", n_sample)
+  anchor_8n <- if (isTRUE(spec$two_peak_adjacent_8n)) extract_indexed_draw_matrix(draws_matrix, "mu_peak_8n", n_sample) else matrix(NA_real_, nrow = n_draw, ncol = n_sample)
+
+  if ("log_R_4n_over_2n" %in% colnames(draws_matrix)) {
+    ratio_4n_over_2n <- exp(draws_matrix[, "log_R_4n_over_2n"])
+  } else if (all(c("R_4n", "R_2n") %in% colnames(draws_matrix))) {
+    ratio_4n_over_2n <- draws_matrix[, "R_4n"] / draws_matrix[, "R_2n"]
+  } else {
+    stop("Could not reconstruct the posterior 4N/2N peak ratio draws.")
+  }
+
+  if (isTRUE(spec$two_peak_adjacent_8n)) {
+    if ("log_R_8n_over_4n" %in% colnames(draws_matrix)) {
+      ratio_8n_over_4n <- exp(draws_matrix[, "log_R_8n_over_4n"])
+    } else if (all(c("R_8n", "R_4n") %in% colnames(draws_matrix))) {
+      ratio_8n_over_4n <- draws_matrix[, "R_8n"] / draws_matrix[, "R_4n"]
+    } else {
+      stop("Could not reconstruct the posterior 8N/4N peak ratio draws.")
+    }
+  } else {
+    ratio_8n_over_4n <- rep(NA_real_, n_draw)
+  }
+
+  M_cen <- exp(log_M_cen)
+  R_2n <- exp(log_R_2n)
+  R_4n <- R_2n * exp(log_R_4n_over_2n)
+  R_8n <- if (isTRUE(spec$two_peak_adjacent_8n)) R_4n * exp(log_R_8n_over_4n) else rep(NA_real_, n_draw)
+  rho <- if (isTRUE(spec$rho_fixed_one)) rep(1, n_draw) else exp(log_rho)
+  reference_eta <- alpha + beta * 0
+  reference_u <- exp(-reference_eta)
+  reference_mu_cen <- M_cen * reference_u / (1 + reference_u)
+  reference_distortion <- (1 + reference_u) / (1 + rho * reference_u)
+  delta_dna_multiplier <- exp(delta_dna)
+  cf_anchor_2n <- delta_dna_multiplier * (reference_mu_cen * R_2n * reference_distortion)
+  cf_anchor_4n <- delta_dna_multiplier * (reference_mu_cen * R_4n * reference_distortion)
+  cf_anchor_8n <- if (isTRUE(spec$two_peak_adjacent_8n)) {
+    delta_dna_multiplier * (reference_mu_cen * R_8n * reference_distortion)
+  } else {
+    matrix(NA_real_, nrow = n_draw, ncol = n_sample)
+  }
+
+  assigned_state <- ifelse(prob_4n >= 0.5, "4N", "2N")
+  lower_anchor <- ifelse(assigned_state == "4N", anchor_4n, anchor_2n)
+  upper_anchor <- ifelse(assigned_state == "4N", anchor_8n, anchor_4n)
+
+  tibble(
+    draw_id = rep(seq_len(n_draw), times = n_sample),
+    sample_index = rep(seq_len(n_sample), each = n_draw),
+    sample_name = rep(input_tbl$sample_name, each = n_draw),
+    condition = rep(input_tbl$condition, each = n_draw),
+    latest_match_date = rep(as.character(input_tbl$latest_match_date), each = n_draw),
+    relative_day = rep(input_tbl$relative_day, each = n_draw),
+    prob_4n = as.vector(prob_4n),
+    assigned_state = as.vector(assigned_state),
+    delta_dna = as.vector(delta_dna),
+    anchor_2n = as.vector(anchor_2n),
+    anchor_4n = as.vector(anchor_4n),
+    anchor_8n = as.vector(anchor_8n),
+    cf_anchor_2n = as.vector(cf_anchor_2n),
+    cf_anchor_4n = as.vector(cf_anchor_4n),
+    cf_anchor_8n = as.vector(cf_anchor_8n),
+    lower_anchor = as.vector(lower_anchor),
+    upper_anchor = as.vector(upper_anchor),
+    ratio_4n_over_2n = rep(ratio_4n_over_2n, times = n_sample),
+    ratio_8n_over_4n = rep(ratio_8n_over_4n, times = n_sample)
+  )
+}
+
+build_flow_component_spec <- function(anchor_row) {
+  if (identical(anchor_row$assigned_state[[1]], "2N")) {
+    anchor_2n <- anchor_row$anchor_2n[[1]]
+    anchor_4n <- anchor_row$anchor_4n[[1]]
+    anchor_8n <- anchor_row$anchor_8n[[1]]
+    midpoint_24 <- (anchor_2n + anchor_4n) / 2
+    midpoint_48 <- (anchor_4n + anchor_8n) / 2
+    spacing_24 <- max(anchor_4n - anchor_2n, 1)
+    spacing_48 <- max(anchor_8n - anchor_4n, 1)
+    means <- c(anchor_2n, midpoint_24, anchor_4n, anchor_4n, midpoint_48, anchor_8n)
+    labels <- c("g1_2n", "s_2n_4n", "g2m_2n", "g1_4n", "s_4n_8n", "g2m_4n")
+    lineage_group <- c("2N", "2N", "2N", "4N", "4N", "4N")
+    phase_group <- c("g1", "s", "g2m", "g1", "s", "g2m")
+    sigma_init <- c(spacing_24, spacing_24, spacing_24, spacing_48, spacing_48, spacing_48) * c(0.08, 0.16, 0.08, 0.08, 0.16, 0.08)
+    sigma_max <- c(spacing_24, spacing_24, spacing_24, spacing_48, spacing_48, spacing_48) * c(0.30, 0.45, 0.30, 0.30, 0.45, 0.30)
+  } else {
+    anchor_4n <- anchor_row$anchor_4n[[1]]
+    anchor_8n <- anchor_row$anchor_8n[[1]]
+    midpoint_48 <- (anchor_4n + anchor_8n) / 2
+    spacing_48 <- max(anchor_8n - anchor_4n, 1)
+    means <- c(anchor_4n, midpoint_48, anchor_8n)
+    labels <- c("g1_4n", "s_4n_8n", "g2m_4n")
+    lineage_group <- c("4N", "4N", "4N")
+    phase_group <- c("g1", "s", "g2m")
+    sigma_init <- c(spacing_48, spacing_48, spacing_48) * c(0.08, 0.16, 0.08)
+    sigma_max <- c(spacing_48, spacing_48, spacing_48) * c(0.30, 0.45, 0.30)
+  }
+
+  tibble(
+    component_index = seq_along(means),
+    component_label = labels,
+    family = "gaussian",
+    lineage_group = lineage_group,
+    phase_group = phase_group,
+    mean = means,
+    sigma_init = pmax(sigma_init, 400),
+    sigma_min = pmax(0.35 * sigma_init, 200),
+    sigma_max = pmax(sigma_max, pmax(2.5 * sigma_init, 1200))
+  ) %>%
+    bind_rows(
+      tibble(
+        component_index = length(means) + 1L,
+        component_label = "noise",
+        family = "uniform",
+        lineage_group = "noise",
+        phase_group = "noise",
+        mean = mean(range(means)),
+        sigma_init = NA_real_,
+        sigma_min = NA_real_,
+        sigma_max = NA_real_
+      )
+    )
+}
+
+fit_fixed_mean_histogram_mixture <- function(hist_tbl, component_tbl, max_iter = 25, sigma_prior_strength = 10, dirichlet_alpha = 1.05) {
+  x <- hist_tbl$bin_mid
+  counts <- hist_tbl$count
+  means <- component_tbl$mean
+  sigma_init <- component_tbl$sigma_init
+  sigma_min <- component_tbl$sigma_min
+  sigma_max <- component_tbl$sigma_max
+  family <- component_tbl$family
+  lineage_group <- component_tbl$lineage_group
+  phase_group <- component_tbl$phase_group
+  k <- length(means)
+  gaussian_idx <- which(family == "gaussian")
+  uniform_idx <- which(family == "uniform")
+  biological_idx <- which(family != "uniform")
+  lineage_levels <- unique(lineage_group[biological_idx])
+  phase_levels <- c("g1", "s", "g2m")
+  x_range <- range(c(hist_tbl$bin_left, hist_tbl$bin_right))
+  uniform_density <- 1 / diff(x_range)
+
+  weights <- rep(1 / k, k)
+  sigmas <- sigma_init
+  loglik <- NA_real_
+
+  for (iter in seq_len(max_iter)) {
+    dens_mat <- vapply(seq_len(k), function(j) {
+      if (identical(family[[j]], "uniform")) {
+        rep(uniform_density, length(x))
+      } else {
+        stats::dnorm(x, mean = means[[j]], sd = sigmas[[j]])
+      }
+    }, numeric(length(x)))
+    dens_mat <- pmax(dens_mat, 1e-300)
+    weighted_mat <- sweep(dens_mat, 2, weights, `*`)
+    row_total <- pmax(rowSums(weighted_mat), 1e-300)
+    resp <- weighted_mat / row_total
+    weighted_resp <- resp * counts
+    nk <- colSums(weighted_resp)
+
+    noise_weight <- if (length(uniform_idx)) {
+      pmax(nk[uniform_idx] + dirichlet_alpha - 1, 1e-8)
+    } else {
+      0
+    }
+    noise_weight <- noise_weight / sum(c(noise_weight, pmax(sum(nk[biological_idx]), 1e-8)))
+    biological_total <- 1 - noise_weight
+
+    lineage_counts <- vapply(lineage_levels, function(lineage_name) {
+      sum(nk[lineage_group == lineage_name], na.rm = TRUE)
+    }, numeric(1))
+    lineage_weights <- pmax(lineage_counts + dirichlet_alpha - 1, 1e-8)
+    lineage_weights <- lineage_weights / sum(lineage_weights)
+    names(lineage_weights) <- lineage_levels
+
+    phase_counts <- vapply(phase_levels, function(phase_name) {
+      sum(nk[phase_group == phase_name], na.rm = TRUE)
+    }, numeric(1))
+    phase_weights <- pmax(phase_counts + dirichlet_alpha - 1, 1e-8)
+    phase_weights <- phase_weights / sum(phase_weights)
+    names(phase_weights) <- phase_levels
+
+    weights[] <- 0
+    if (length(biological_idx)) {
+      weights[biological_idx] <- biological_total *
+        lineage_weights[lineage_group[biological_idx]] *
+        phase_weights[phase_group[biological_idx]]
+    }
+    if (length(uniform_idx)) {
+      weights[uniform_idx] <- noise_weight
+    }
+
+    if (length(gaussian_idx)) {
+      for (phase_name in phase_levels) {
+        phase_idx <- gaussian_idx[phase_group[gaussian_idx] == phase_name]
+        if (!length(phase_idx)) {
+          next
+        }
+        phase_resp_total <- 0
+        phase_var_total <- 0
+        prior_var <- mean(sigma_init[phase_idx]^2, na.rm = TRUE)
+        for (j in phase_idx) {
+          centered_sq <- (x - means[[j]])^2
+          phase_resp_total <- phase_resp_total + sum(weighted_resp[, j] * centered_sq)
+          phase_var_total <- phase_var_total + nk[[j]]
+        }
+        sigma_sq <- (phase_resp_total + sigma_prior_strength * prior_var) / pmax(phase_var_total + sigma_prior_strength, 1e-8)
+        shared_sigma <- sqrt(sigma_sq)
+        shared_sigma <- min(max(shared_sigma, min(sigma_min[phase_idx], na.rm = TRUE)), max(sigma_max[phase_idx], na.rm = TRUE))
+        sigmas[phase_idx] <- shared_sigma
+      }
+    }
+
+    loglik <- sum(counts * log(row_total))
+  }
+
+  bin_width <- stats::median(hist_tbl$bin_width)
+  fitted_density <- rowSums(vapply(seq_len(k), function(j) {
+    if (identical(family[[j]], "uniform")) {
+      weights[[j]] * rep(uniform_density, length(x))
+    } else {
+      weights[[j]] * stats::dnorm(x, mean = means[[j]], sd = sigmas[[j]])
+    }
+  }, numeric(length(x))))
+
+  list(
+    component_tbl = component_tbl %>%
+      mutate(weight = weights, sigma = sigmas),
+    overlay_tbl = hist_tbl %>%
+      transmute(
+        bin_mid,
+        observed_count = count,
+        observed_density = density,
+        fitted_density = fitted_density,
+        fitted_count = fitted_density * sum(counts) * bin_width
+      ),
+    loglik = loglik
+  )
+}
+
+fit_flow_posterior_histograms <- function(
+  project_root,
+  spec_name = "adjacent_8n_delta_dna",
+  output_category = "extensions",
+  max_draws = NULL,
+  threshold = NULL,
+  min_bins = 60,
+  max_bins = 160
+) {
+  spec_registry <- c(get_ablation_registry(), get_extension_registry())
+  if (!spec_name %in% names(spec_registry)) {
+    stop(sprintf("Unknown spec `%s`.", spec_name))
+  }
+
+  spec <- spec_registry[[spec_name]]
+  if (!isTRUE(spec$two_peak_adjacent_8n) || !isTRUE(spec$sample_delta_dna)) {
+    stop("This posterior histogram fitter currently expects the adjacent_8n_delta_dna-style extension.")
+  }
+
+  prepared_path <- file.path(project_root, "dev", "hypoxia_peak_reduced", "output", "prepared_input.rds")
+  prepared <- readRDS(prepared_path)
+  threshold <- if (is.null(threshold)) prepared$threshold else threshold
+
+  nuts_dir <- file.path(project_root, "dev", "hypoxia_peak_reduced", "output", output_category, spec$name, "nuts")
+  draws_path <- file.path(nuts_dir, "draws_matrix.rds")
+  draws_matrix <- readRDS(draws_path)
+  if (!is.null(max_draws)) {
+    draw_idx <- select_evenly_spaced_draw_indices(nrow(draws_matrix), max_draws)
+    draws_matrix <- draws_matrix[draw_idx, , drop = FALSE]
+  }
+  anchor_draw_tbl <- build_flow_anchor_draws(draws_matrix, prepared, spec)
+
+  dna_path <- file.path(project_root, "processed_data", "hypoxia-sum159", "filtered_dna_area_vectors.rds")
+  raw_vectors <- readRDS(dna_path)$raw
+
+  sample_histograms <- lapply(prepared$input_tbl$sample_name, function(sample_name) {
+    if (!sample_name %in% names(raw_vectors)) {
+      stop(sprintf("Missing raw DNA vector for sample `%s`.", sample_name))
+    }
+    build_flow_event_histogram(raw_vectors[[sample_name]], threshold = threshold, min_bins = min_bins, max_bins = max_bins)
+  })
+  names(sample_histograms) <- prepared$input_tbl$sample_name
+
+  sample_objects <- vector("list", length(sample_histograms))
+  names(sample_objects) <- names(sample_histograms)
+  component_draw_parts <- vector("list", length(sample_histograms))
+  draw_summary_parts <- vector("list", length(sample_histograms))
+  overlay_parts <- vector("list", length(sample_histograms))
+
+  for (sample_i in seq_along(sample_histograms)) {
+    sample_name <- names(sample_histograms)[[sample_i]]
+    hist_tbl <- sample_histograms[[sample_i]]
+    sample_anchor_tbl <- anchor_draw_tbl %>%
+      filter(sample_name == !!sample_name)
+
+    fit_parts <- lapply(seq_len(nrow(sample_anchor_tbl)), function(draw_i) {
+      anchor_row <- sample_anchor_tbl[draw_i, , drop = FALSE]
+      component_spec <- build_flow_component_spec(anchor_row)
+      fit_fixed_mean_histogram_mixture(hist_tbl, component_spec)
+    })
+
+    component_draw_tbl <- bind_rows(lapply(seq_len(nrow(sample_anchor_tbl)), function(draw_i) {
+      anchor_row <- sample_anchor_tbl[draw_i, , drop = FALSE]
+      fit_obj <- fit_parts[[draw_i]]
+      fit_obj$component_tbl %>%
+        transmute(
+          draw_id = anchor_row$draw_id[[1]],
+          sample_index = anchor_row$sample_index[[1]],
+          sample_name = anchor_row$sample_name[[1]],
+          assigned_state = anchor_row$assigned_state[[1]],
+          component_index,
+          component_label,
+          constrained_location = mean,
+          weight,
+          sigma
+        )
+    }))
+
+    draw_summary_tbl <- bind_rows(lapply(seq_len(nrow(sample_anchor_tbl)), function(draw_i) {
+      anchor_row <- sample_anchor_tbl[draw_i, , drop = FALSE]
+      fit_obj <- fit_parts[[draw_i]]
+      tibble(
+        draw_id = anchor_row$draw_id[[1]],
+        sample_index = anchor_row$sample_index[[1]],
+        sample_name = anchor_row$sample_name[[1]],
+        condition = anchor_row$condition[[1]],
+        latest_match_date = anchor_row$latest_match_date[[1]],
+        relative_day = anchor_row$relative_day[[1]],
+        assigned_state = anchor_row$assigned_state[[1]],
+        prob_4n = anchor_row$prob_4n[[1]],
+        delta_dna = anchor_row$delta_dna[[1]],
+        anchor_2n = anchor_row$anchor_2n[[1]],
+        anchor_4n = anchor_row$anchor_4n[[1]],
+        anchor_8n = anchor_row$anchor_8n[[1]],
+        cf_anchor_2n = anchor_row$cf_anchor_2n[[1]],
+        cf_anchor_4n = anchor_row$cf_anchor_4n[[1]],
+        cf_anchor_8n = anchor_row$cf_anchor_8n[[1]],
+        lower_anchor = anchor_row$lower_anchor[[1]],
+        upper_anchor = anchor_row$upper_anchor[[1]],
+        loglik = fit_obj$loglik
+      )
+    }))
+
+    overlay_array <- simplify2array(lapply(fit_parts, function(fit_obj) fit_obj$overlay_tbl$fitted_count))
+    overlay_density_array <- simplify2array(lapply(fit_parts, function(fit_obj) fit_obj$overlay_tbl$fitted_density))
+    overlay_quant <- t(apply(overlay_array, 1, safe_quantile, probs = c(0.05, 0.5, 0.95)))
+    overlay_density_quant <- t(apply(overlay_density_array, 1, safe_quantile, probs = c(0.05, 0.5, 0.95)))
+    overlay_tbl <- hist_tbl %>%
+      transmute(
+        sample_name = sample_name,
+        bin_left,
+        bin_right,
+        bin_mid,
+        observed_count = count,
+        observed_density = density,
+        fitted_count_q05 = overlay_quant[, 1],
+        fitted_count_median = overlay_quant[, 2],
+        fitted_count_q95 = overlay_quant[, 3],
+        fitted_density_q05 = overlay_density_quant[, 1],
+        fitted_density_median = overlay_density_quant[, 2],
+        fitted_density_q95 = overlay_density_quant[, 3]
+      )
+
+    component_summary_tbl <- component_draw_tbl %>%
+      group_by(sample_name, assigned_state, component_index, component_label) %>%
+      summarise(
+        constrained_location_mean = mean(constrained_location, na.rm = TRUE),
+        constrained_location_median = stats::median(constrained_location, na.rm = TRUE),
+        weight_mean = mean(weight, na.rm = TRUE),
+        weight_median = stats::median(weight, na.rm = TRUE),
+        weight_q05 = safe_quantile(weight, 0.05),
+        weight_q95 = safe_quantile(weight, 0.95),
+        sigma_mean = mean(sigma, na.rm = TRUE),
+        sigma_median = stats::median(sigma, na.rm = TRUE),
+        sigma_q05 = safe_quantile(sigma, 0.05),
+        sigma_q95 = safe_quantile(sigma, 0.95),
+        .groups = "drop"
+      )
+
+    sample_summary_tbl <- draw_summary_tbl %>%
+      summarise(
+        sample_name = first(sample_name),
+        condition = first(condition),
+        latest_match_date = first(latest_match_date),
+        relative_day = first(relative_day),
+        posterior_prob_4n = mean(prob_4n, na.rm = TRUE),
+        assigned_state_map = ifelse(mean(prob_4n, na.rm = TRUE) >= 0.5, "4N", "2N"),
+        lower_anchor_mean = mean(lower_anchor, na.rm = TRUE),
+        lower_anchor_median = stats::median(lower_anchor, na.rm = TRUE),
+        lower_anchor_q05 = safe_quantile(lower_anchor, 0.05),
+        lower_anchor_q95 = safe_quantile(lower_anchor, 0.95),
+        upper_anchor_mean = mean(upper_anchor, na.rm = TRUE),
+        upper_anchor_median = stats::median(upper_anchor, na.rm = TRUE),
+        upper_anchor_q05 = safe_quantile(upper_anchor, 0.05),
+        upper_anchor_q95 = safe_quantile(upper_anchor, 0.95),
+        mean_loglik = mean(loglik, na.rm = TRUE),
+        gated_n_above_threshold = sum(hist_tbl$observed_count)
+      )
+
+    sample_objects[[sample_i]] <- list(
+      hist_tbl = hist_tbl,
+      draw_summary_tbl = draw_summary_tbl,
+      component_draw_tbl = component_draw_tbl,
+      component_summary_tbl = component_summary_tbl,
+      overlay_tbl = overlay_tbl,
+      sample_summary_tbl = sample_summary_tbl
+    )
+    component_draw_parts[[sample_i]] <- component_draw_tbl
+    draw_summary_parts[[sample_i]] <- draw_summary_tbl
+    overlay_parts[[sample_i]] <- overlay_tbl
+  }
+
+  component_draw_tbl <- bind_rows(component_draw_parts)
+  draw_summary_tbl <- bind_rows(draw_summary_parts)
+  overlay_tbl <- bind_rows(overlay_parts)
+  component_summary_tbl <- bind_rows(lapply(sample_objects, `[[`, "component_summary_tbl"))
+  sample_summary_tbl <- bind_rows(lapply(sample_objects, `[[`, "sample_summary_tbl")) %>%
+    arrange(lower_anchor_median)
+
+  distribution_object <- list(
+    metadata = list(
+      project_root = normalizePath(project_root, winslash = "/", mustWork = TRUE),
+      spec_name = spec$name,
+      output_category = output_category,
+      threshold = threshold,
+      n_draw = nrow(draws_matrix),
+      n_sample = nrow(prepared$input_tbl)
+    ),
+    samples = sample_objects,
+    sample_summary_tbl = sample_summary_tbl,
+    component_summary_tbl = component_summary_tbl,
+    draw_summary_tbl = draw_summary_tbl,
+    component_draw_tbl = component_draw_tbl,
+    overlay_tbl = overlay_tbl
+  )
+
+  list(
+    spec = spec,
+    nuts_dir = nuts_dir,
+    threshold = threshold,
+    distribution_object = distribution_object
+  )
+}
+
+plot_flow_histogram_overlays <- function(overlay_tbl, sample_summary_tbl) {
+  sample_levels <- unique(sample_summary_tbl$sample_name)
+  plot_tbl <- overlay_tbl %>%
+    inner_join(sample_summary_tbl %>% select(sample_name, lower_anchor_median, assigned_state_map), by = "sample_name") %>%
+    mutate(
+      sample_label = factor(sample_name, levels = sample_levels)
+    )
+
+  ggplot(plot_tbl, aes(x = bin_mid)) +
+    geom_rect(aes(xmin = bin_left, xmax = bin_right, ymin = 0, ymax = observed_density), fill = "grey82", color = "white", linewidth = 0.12) +
+    geom_ribbon(aes(ymin = fitted_density_q05, ymax = fitted_density_q95), fill = "#9ecae1", alpha = 0.45) +
+    geom_line(aes(y = fitted_density_median), color = "#08519c", linewidth = 0.5) +
+    geom_vline(aes(xintercept = lower_anchor_median), color = "#cb181d", linewidth = 0.35, linetype = "dashed") +
+    facet_wrap(~ sample_label, scales = "free_y", ncol = 4) +
+    labs(
+      title = "Flow-only posterior histogram overlays",
+      subtitle = "Observed above-threshold DNA-A histograms with draw-propagated constrained fits.",
+      x = "DNA-A",
+      y = "Density"
+    ) +
+    theme_bw(base_size = 9) +
+    theme(panel.grid.minor = element_blank())
+}
+
+build_flow_state_distribution_outputs <- function(distribution_object, g0g1_samples_per_draw = 200, predictive_seed = 1L) {
+  component_draw_tbl <- distribution_object$component_draw_tbl
+  draw_anchor_tbl <- distribution_object$draw_summary_tbl %>%
+    distinct(sample_name, draw_id, anchor_2n, anchor_4n, anchor_8n, cf_anchor_2n, cf_anchor_4n, cf_anchor_8n)
+  sample_summary_tbl <- distribution_object$sample_summary_tbl %>%
+    distinct(sample_name, .keep_all = TRUE) %>%
+    mutate(sample_name = as.character(sample_name))
+  sample_levels <- unique(sample_summary_tbl$sample_name)
+
+  biological_draw_tbl <- component_draw_tbl %>%
+    filter(component_label != "noise") %>%
+    group_by(sample_name, draw_id) %>%
+    mutate(
+      biological_weight_total = sum(weight, na.rm = TRUE),
+      state_fraction_biological = weight / pmax(biological_weight_total, 1e-8)
+    ) %>%
+    ungroup()
+
+  state_summary_tbl <- biological_draw_tbl %>%
+    group_by(sample_name, component_label) %>%
+    summarise(
+      mean_state_weight = mean(weight, na.rm = TRUE),
+      median_state_weight = stats::median(weight, na.rm = TRUE),
+      q05_state_weight = safe_quantile(weight, 0.05),
+      q95_state_weight = safe_quantile(weight, 0.95),
+      mean_state_fraction_biological = mean(state_fraction_biological, na.rm = TRUE),
+      median_state_fraction_biological = stats::median(state_fraction_biological, na.rm = TRUE),
+      q05_state_fraction_biological = safe_quantile(state_fraction_biological, 0.05),
+      q95_state_fraction_biological = safe_quantile(state_fraction_biological, 0.95),
+      .groups = "drop"
+    ) %>%
+    mutate(sample_name = factor(sample_name, levels = sample_levels))
+
+  g0g1_draw_tbl <- component_draw_tbl %>%
+    filter(component_label %in% c("g1_2n", "g1_4n")) %>%
+    group_by(sample_name, draw_id) %>%
+    mutate(
+      g0g1_weight_total = sum(weight, na.rm = TRUE),
+      g0g1_fraction = weight / pmax(g0g1_weight_total, 1e-8)
+    ) %>%
+    ungroup() %>%
+    select(sample_name, draw_id, component_label, constrained_location, sigma, weight, g0g1_fraction) %>%
+    tidyr::pivot_wider(
+      names_from = component_label,
+      values_from = c(constrained_location, sigma, weight, g0g1_fraction),
+      values_fill = 0
+    ) %>%
+    mutate(
+      sample_name = as.character(sample_name),
+      g1_2n_location = ifelse(weight_g1_2n > 0, constrained_location_g1_2n, NA_real_),
+      g1_4n_location = ifelse(weight_g1_4n > 0, constrained_location_g1_4n, NA_real_),
+      g1_2n_sigma = ifelse(weight_g1_2n > 0, sigma_g1_2n, NA_real_),
+      g1_4n_sigma = ifelse(weight_g1_4n > 0, sigma_g1_4n, NA_real_),
+      g1_2n_weight = weight_g1_2n,
+      g1_4n_weight = weight_g1_4n,
+      g1_2n_fraction = g0g1_fraction_g1_2n,
+      g1_4n_fraction = g0g1_fraction_g1_4n
+    ) %>%
+    select(sample_name, draw_id, g1_2n_location, g1_4n_location, g1_2n_sigma, g1_4n_sigma, g1_2n_weight, g1_4n_weight, g1_2n_fraction, g1_4n_fraction)
+
+  g0g1_draw_tbl <- g0g1_draw_tbl %>%
+    left_join(draw_anchor_tbl, by = c("sample_name", "draw_id"))
+
+  g0g1_summary_tbl <- g0g1_draw_tbl %>%
+    group_by(sample_name) %>%
+    summarise(
+      g1_2n_fraction_mean = mean(g1_2n_fraction, na.rm = TRUE),
+      g1_2n_fraction_median = stats::median(g1_2n_fraction, na.rm = TRUE),
+      g1_2n_fraction_q05 = safe_quantile(g1_2n_fraction, 0.05),
+      g1_2n_fraction_q95 = safe_quantile(g1_2n_fraction, 0.95),
+      g1_4n_fraction_mean = mean(g1_4n_fraction, na.rm = TRUE),
+      g1_4n_fraction_median = stats::median(g1_4n_fraction, na.rm = TRUE),
+      g1_4n_fraction_q05 = safe_quantile(g1_4n_fraction, 0.05),
+      g1_4n_fraction_q95 = safe_quantile(g1_4n_fraction, 0.95),
+      g1_2n_location_mean = mean(g1_2n_location, na.rm = TRUE),
+      g1_2n_location_median = stats::median(g1_2n_location, na.rm = TRUE),
+      g1_2n_location_q05 = safe_quantile(g1_2n_location, 0.05),
+      g1_2n_location_q95 = safe_quantile(g1_2n_location, 0.95),
+      g1_4n_location_mean = mean(g1_4n_location, na.rm = TRUE),
+      g1_4n_location_median = stats::median(g1_4n_location, na.rm = TRUE),
+      g1_4n_location_q05 = safe_quantile(g1_4n_location, 0.05),
+      g1_4n_location_q95 = safe_quantile(g1_4n_location, 0.95),
+      .groups = "drop"
+    ) %>%
+    left_join(sample_summary_tbl %>% select(sample_name, condition, latest_match_date, relative_day, assigned_state_map), by = "sample_name") %>%
+    mutate(sample_name = factor(sample_name, levels = sample_levels))
+
+  set.seed(as.integer(predictive_seed))
+  g0g1_predictive_samples_tbl <- bind_rows(lapply(split(g0g1_draw_tbl, g0g1_draw_tbl$sample_name), function(sample_draws) {
+    sample_name <- unique(sample_draws$sample_name)[[1]]
+    bind_rows(lapply(seq_len(nrow(sample_draws)), function(i) {
+      row_i <- sample_draws[i, , drop = FALSE]
+      a2 <- row_i$cf_anchor_2n[[1]]
+      a4 <- row_i$cf_anchor_4n[[1]]
+      a8 <- row_i$cf_anchor_8n[[1]]
+      if (!all(is.finite(c(a2, a4, a8))) || !(a2 < a4 && a4 < a8)) {
+        return(NULL)
+      }
+
+      component_probs <- c(row_i$g1_2n_fraction[[1]], row_i$g1_4n_fraction[[1]])
+      component_probs[!is.finite(component_probs)] <- 0
+      if (sum(component_probs) <= 0) {
+        return(NULL)
+      }
+      component_probs <- component_probs / sum(component_probs)
+      sampled_component <- sample(c("g1_2n", "g1_4n"), size = g0g1_samples_per_draw, replace = TRUE, prob = component_probs)
+      dna_values <- numeric(g0g1_samples_per_draw)
+
+      idx_2n <- sampled_component == "g1_2n"
+      if (any(idx_2n)) {
+        dna_values[idx_2n] <- stats::rnorm(sum(idx_2n), mean = row_i$g1_2n_location[[1]], sd = row_i$g1_2n_sigma[[1]])
+      }
+      idx_4n <- sampled_component == "g1_4n"
+      if (any(idx_4n)) {
+        dna_values[idx_4n] <- stats::rnorm(sum(idx_4n), mean = row_i$g1_4n_location[[1]], sd = row_i$g1_4n_sigma[[1]])
+      }
+
+      tibble(
+        sample_name = sample_name,
+        draw_id = row_i$draw_id[[1]],
+        sampled_component = sampled_component,
+        dna_value = dna_values,
+        ploidy_value = map_dna_to_ploidy_counterfactual(dna_values, a2, a4, a8)
+      )
+    }))
+  }))
+
+  g0g1_predictive_density_tbl <- bind_rows(lapply(split(g0g1_predictive_samples_tbl, g0g1_predictive_samples_tbl$sample_name), function(sample_tbl) {
+    ploidy_vals <- sample_tbl$ploidy_value[is.finite(sample_tbl$ploidy_value)]
+    if (length(ploidy_vals) < 10 || length(unique(ploidy_vals)) < 2) {
+      return(tibble(sample_name = unique(sample_tbl$sample_name)[[1]], ploidy = numeric(), predictive_density = numeric()))
+    }
+    dens <- stats::density(ploidy_vals, from = 0.5, to = 8.5, n = 400, na.rm = TRUE)
+    tibble(
+      sample_name = unique(sample_tbl$sample_name)[[1]],
+      ploidy = dens$x,
+      predictive_density = dens$y
+    )
+  }))
+
+  g0g1_density_grid_tbl <- bind_rows(lapply(split(g0g1_predictive_samples_tbl, g0g1_predictive_samples_tbl$sample_name), function(sample_tbl) {
+    sample_name <- unique(sample_tbl$sample_name)[[1]]
+    ploidy_vals <- sample_tbl$ploidy_value[is.finite(sample_tbl$ploidy_value)]
+    if (length(ploidy_vals) < 10 || length(unique(ploidy_vals)) < 2) {
+      return(tibble(
+        sample_name = sample_name,
+        grid_index = integer(),
+        ploidy = numeric(),
+        log_density = numeric()
+      ))
+    }
+
+    dens <- stats::density(ploidy_vals, from = 0.5, to = 8.5, n = 200, na.rm = TRUE)
+    density_floored <- pmax(dens$y, 1e-12)
+    density_norm <- density_floored / trapz_integral(dens$x, density_floored)
+
+    tibble(
+      sample_name = sample_name,
+      grid_index = seq_along(dens$x),
+      ploidy = dens$x,
+      log_density = log(density_norm)
+    )
+  }))
+
+  list(
+    state_summary_tbl = state_summary_tbl,
+    g0g1_draw_tbl = g0g1_draw_tbl,
+    g0g1_summary_tbl = g0g1_summary_tbl,
+    g0g1_predictive_samples_tbl = g0g1_predictive_samples_tbl,
+    g0g1_predictive_density_tbl = g0g1_predictive_density_tbl,
+    g0g1_density_grid_tbl = g0g1_density_grid_tbl
+  )
+}
+
+plot_flow_state_distribution <- function(state_summary_tbl) {
+  plot_tbl <- state_summary_tbl %>%
+    mutate(
+      sample_name = factor(as.character(sample_name), levels = unique(as.character(sample_name))),
+      component_label = factor(
+        component_label,
+        levels = c("g1_2n", "s_2n_4n", "g2m_2n", "g1_4n", "s_4n_8n", "g2m_4n")
+      )
+    )
+
+  ggplot(plot_tbl, aes(x = sample_name, y = mean_state_fraction_biological, fill = component_label)) +
+    geom_col(width = 0.82) +
+    scale_fill_manual(
+      values = c(
+        "g1_2n" = "#2166ac",
+        "s_2n_4n" = "#67a9cf",
+        "g2m_2n" = "#d1e5f0",
+        "g1_4n" = "#b2182b",
+        "s_4n_8n" = "#ef8a62",
+        "g2m_4n" = "#fddbc7"
+      )
+    ) +
+    labs(
+      title = "Posterior mean biological state composition",
+      subtitle = "Stacked fractions are normalized across the six biological states only; noise is excluded.",
+      x = NULL,
+      y = "Fraction of biological mass",
+      fill = "State"
+    ) +
+    theme_bw(base_size = 9) +
+    theme(
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1)
+    )
+}
+
+plot_g0g1_ploidy_stacked_bar <- function(g0g1_summary_tbl) {
+  plot_tbl <- g0g1_summary_tbl %>%
+    mutate(sample_name = factor(as.character(sample_name), levels = unique(as.character(sample_name)))) %>%
+    select(sample_name, g1_2n_fraction_mean, g1_4n_fraction_mean) %>%
+    tidyr::pivot_longer(
+      cols = c(g1_2n_fraction_mean, g1_4n_fraction_mean),
+      names_to = "g0g1_state",
+      values_to = "fraction"
+    ) %>%
+    mutate(
+      g0g1_state = recode(
+        g0g1_state,
+        g1_2n_fraction_mean = "G0/G1 2N",
+        g1_4n_fraction_mean = "G0/G1 4N"
+      )
+    )
+
+  ggplot(plot_tbl, aes(x = sample_name, y = fraction, fill = g0g1_state)) +
+    geom_col(width = 0.82) +
+    scale_fill_manual(values = c("G0/G1 2N" = "#2166ac", "G0/G1 4N" = "#b2182b")) +
+    labs(
+      title = "Posterior mean G0/G1 ploidy composition",
+      subtitle = "Fractions are normalized within the G0/G1 subpopulation.",
+      x = NULL,
+      y = "Fraction of G0/G1 mass",
+      fill = "G0/G1 state"
+    ) +
+    theme_bw(base_size = 9) +
+    theme(
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1)
+    )
+}
+
+plot_g0g1_ploidy_density <- function(g0g1_predictive_density_tbl, g0g1_summary_tbl) {
+  sample_levels <- unique(as.character(g0g1_summary_tbl$sample_name))
+  plot_tbl <- g0g1_predictive_density_tbl %>%
+    mutate(sample_name = factor(sample_name, levels = sample_levels))
+
+  ggplot(plot_tbl, aes(x = ploidy)) +
+    geom_line(aes(y = predictive_density), color = "#08519c", linewidth = 0.6) +
+    facet_wrap(~ sample_name, scales = "free_y", ncol = 4) +
+    scale_x_continuous(
+      breaks = c(2, 4, 8),
+      labels = c("2N", "4N", "8N")
+    ) +
+    labs(
+      title = "Posterior predictive G0/G1 ploidy density",
+      subtitle = "Each sample pools predictive ploidy samples drawn from the fitted G0/G1 mixtures under the draw-specific delta-only counterfactual DNA-to-ploidy map.",
+      x = "Ploidy",
+      y = "Density"
+    ) +
+    theme_bw(base_size = 9) +
+    theme(panel.grid.minor = element_blank())
+}
+
+write_flow_posterior_histogram_outputs <- function(
+  project_root,
+  spec_name = "adjacent_8n_delta_dna",
+  output_category = "extensions",
+  max_draws = NULL,
+  threshold = NULL,
+  min_bins = 60,
+  max_bins = 160
+) {
+  fit_parts <- fit_flow_posterior_histograms(
+    project_root = project_root,
+    spec_name = spec_name,
+    output_category = output_category,
+    max_draws = max_draws,
+    threshold = threshold,
+    min_bins = min_bins,
+    max_bins = max_bins
+  )
+
+  out_dir <- file.path(fit_parts$nuts_dir, "flow_only_distribution")
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  distribution_rds_path <- file.path(out_dir, "flow_only_distribution.rds")
+  sample_summary_csv_path <- file.path(out_dir, "sample_flow_distribution_summary.csv")
+  component_summary_csv_path <- file.path(out_dir, "component_flow_distribution_summary.csv")
+  draw_summary_csv_path <- file.path(out_dir, "draw_flow_distribution_summary.csv")
+  component_draw_csv_path <- file.path(out_dir, "component_flow_distribution_draws.csv")
+  overlay_csv_path <- file.path(out_dir, "flow_distribution_overlay_summary.csv")
+  overlay_plot_path <- file.path(out_dir, "flow_distribution_overlays.png")
+  state_summary_csv_path <- file.path(out_dir, "state_distribution_summary.csv")
+  state_plot_path <- file.path(out_dir, "state_distribution_stacked_bar.png")
+  g0g1_draw_csv_path <- file.path(out_dir, "g0g1_ploidy_distribution_draws.csv")
+  g0g1_summary_csv_path <- file.path(out_dir, "g0g1_ploidy_distribution_summary.csv")
+  g0g1_predictive_samples_csv_path <- file.path(out_dir, "g0g1_ploidy_predictive_samples.csv")
+  g0g1_density_grid_csv_path <- file.path(out_dir, "g0g1_ploidy_density_grid.csv")
+  g0g1_bar_plot_path <- file.path(out_dir, "g0g1_ploidy_stacked_bar.png")
+  g0g1_density_plot_path <- file.path(out_dir, "g0g1_ploidy_density.png")
+
+  saveRDS(fit_parts$distribution_object, distribution_rds_path)
+  write.csv(fit_parts$distribution_object$sample_summary_tbl, sample_summary_csv_path, row.names = FALSE)
+  write.csv(fit_parts$distribution_object$component_summary_tbl, component_summary_csv_path, row.names = FALSE)
+  write.csv(fit_parts$distribution_object$draw_summary_tbl, draw_summary_csv_path, row.names = FALSE)
+  write.csv(fit_parts$distribution_object$component_draw_tbl, component_draw_csv_path, row.names = FALSE)
+  write.csv(fit_parts$distribution_object$overlay_tbl, overlay_csv_path, row.names = FALSE)
+
+  state_parts <- build_flow_state_distribution_outputs(fit_parts$distribution_object)
+  write.csv(state_parts$state_summary_tbl, state_summary_csv_path, row.names = FALSE)
+  write.csv(state_parts$g0g1_draw_tbl, g0g1_draw_csv_path, row.names = FALSE)
+  write.csv(state_parts$g0g1_summary_tbl, g0g1_summary_csv_path, row.names = FALSE)
+  write.csv(state_parts$g0g1_predictive_samples_tbl, g0g1_predictive_samples_csv_path, row.names = FALSE)
+  write.csv(state_parts$g0g1_density_grid_tbl, g0g1_density_grid_csv_path, row.names = FALSE)
+
+  ggplot2::ggsave(
+    overlay_plot_path,
+    plot_flow_histogram_overlays(
+      fit_parts$distribution_object$overlay_tbl,
+      fit_parts$distribution_object$sample_summary_tbl
+    ),
+    width = 14,
+    height = 10,
+    dpi = 220
+  )
+  ggplot2::ggsave(
+    state_plot_path,
+    plot_flow_state_distribution(state_parts$state_summary_tbl),
+    width = 13,
+    height = 7,
+    dpi = 220
+  )
+  ggplot2::ggsave(
+    g0g1_bar_plot_path,
+    plot_g0g1_ploidy_stacked_bar(state_parts$g0g1_summary_tbl),
+    width = 13,
+    height = 7,
+    dpi = 220
+  )
+  ggplot2::ggsave(
+    g0g1_density_plot_path,
+    plot_g0g1_ploidy_density(state_parts$g0g1_predictive_density_tbl, state_parts$g0g1_summary_tbl),
+    width = 14,
+    height = 10,
+    dpi = 220
+  )
+
+  c(
+    fit_parts,
+    list(
+      out_dir = out_dir,
+      distribution_rds_path = distribution_rds_path,
+      sample_summary_csv_path = sample_summary_csv_path,
+      component_summary_csv_path = component_summary_csv_path,
+      draw_summary_csv_path = draw_summary_csv_path,
+      component_draw_csv_path = component_draw_csv_path,
+      overlay_csv_path = overlay_csv_path,
+      overlay_plot_path = overlay_plot_path,
+      state_summary_csv_path = state_summary_csv_path,
+      state_plot_path = state_plot_path,
+      g0g1_draw_csv_path = g0g1_draw_csv_path,
+      g0g1_summary_csv_path = g0g1_summary_csv_path,
+      g0g1_predictive_samples_csv_path = g0g1_predictive_samples_csv_path,
+      g0g1_density_grid_csv_path = g0g1_density_grid_csv_path,
+      g0g1_bar_plot_path = g0g1_bar_plot_path,
+      g0g1_density_plot_path = g0g1_density_plot_path
+    )
+  )
+}
+
+plot_flow_histogram_draw_overlays <- function(draw_overlay_tbl) {
+  plot_tbl <- draw_overlay_tbl %>%
+    mutate(
+      sample_label = factor(sample_name, levels = unique(sample_name)),
+      draw_label = paste0("Draw ", draw_id, " (", assigned_state, ")")
+    )
+
+  ggplot(plot_tbl, aes(x = bin_mid)) +
+    geom_rect(
+      aes(xmin = bin_left, xmax = bin_right, ymin = 0, ymax = observed_density),
+      fill = "grey82",
+      color = "white",
+      linewidth = 0.12
+    ) +
+    geom_line(
+      aes(y = fitted_density, color = draw_label, group = draw_id),
+      linewidth = 0.55,
+      alpha = 0.9
+    ) +
+    facet_wrap(~ sample_label, scales = "free_y", ncol = 2) +
+    labs(
+      title = "Trial flow-only histogram overlays",
+      subtitle = "Observed above-threshold DNA-A histograms with one fitted curve per posterior draw.",
+      x = "DNA-A",
+      y = "Density",
+      color = "Posterior draw"
+    ) +
+    theme_bw(base_size = 9) +
+    theme(panel.grid.minor = element_blank())
+}
+
+write_flow_posterior_histogram_trial_outputs <- function(
+  project_root,
+  spec_name = "adjacent_8n_delta_dna",
+  output_category = "extensions",
+  sample_names,
+  draw_ids = 1:3,
+  threshold = NULL,
+  min_bins = 60,
+  max_bins = 160
+) {
+  spec_registry <- c(get_ablation_registry(), get_extension_registry())
+  if (!spec_name %in% names(spec_registry)) {
+    stop(sprintf("Unknown spec `%s`.", spec_name))
+  }
+
+  spec <- spec_registry[[spec_name]]
+  prepared_path <- file.path(project_root, "dev", "hypoxia_peak_reduced", "output", "prepared_input.rds")
+  prepared <- readRDS(prepared_path)
+  threshold <- if (is.null(threshold)) prepared$threshold else threshold
+
+  if (missing(sample_names) || !length(sample_names)) {
+    stop("Please provide at least one sample name for the trial fit.")
+  }
+
+  missing_samples <- setdiff(sample_names, prepared$input_tbl$sample_name)
+  if (length(missing_samples)) {
+    stop(sprintf("Unknown sample(s): %s", paste(missing_samples, collapse = ", ")))
+  }
+
+  nuts_dir <- file.path(project_root, "dev", "hypoxia_peak_reduced", "output", output_category, spec$name, "nuts")
+  draws_matrix <- readRDS(file.path(nuts_dir, "draws_matrix.rds"))
+  anchor_draw_tbl <- build_flow_anchor_draws(draws_matrix, prepared, spec) %>%
+    filter(sample_name %in% sample_names, draw_id %in% draw_ids)
+
+  dna_path <- file.path(project_root, "processed_data", "hypoxia-sum159", "filtered_dna_area_vectors.rds")
+  raw_vectors <- readRDS(dna_path)$raw
+  sample_histograms <- lapply(sample_names, function(sample_name) {
+    build_flow_event_histogram(raw_vectors[[sample_name]], threshold = threshold, min_bins = min_bins, max_bins = max_bins)
+  })
+  names(sample_histograms) <- sample_names
+
+  draw_overlay_tbl <- bind_rows(lapply(sample_names, function(sample_name) {
+    hist_tbl <- sample_histograms[[sample_name]]
+    sample_anchor_tbl <- anchor_draw_tbl %>% filter(sample_name == !!sample_name) %>% arrange(draw_id)
+    bind_rows(lapply(seq_len(nrow(sample_anchor_tbl)), function(i) {
+      anchor_row <- sample_anchor_tbl[i, , drop = FALSE]
+      fit_obj <- fit_fixed_mean_histogram_mixture(hist_tbl, build_flow_component_spec(anchor_row))
+      fit_obj$overlay_tbl %>%
+        transmute(
+          sample_name = sample_name,
+          draw_id = anchor_row$draw_id[[1]],
+          assigned_state = anchor_row$assigned_state[[1]],
+          bin_left = hist_tbl$bin_left,
+          bin_right = hist_tbl$bin_right,
+          bin_mid,
+          observed_count,
+          observed_density,
+          fitted_count,
+          fitted_density
+        )
+    }))
+  }))
+
+  component_draw_tbl <- bind_rows(lapply(sample_names, function(sample_name) {
+    hist_tbl <- sample_histograms[[sample_name]]
+    sample_anchor_tbl <- anchor_draw_tbl %>% filter(sample_name == !!sample_name) %>% arrange(draw_id)
+    bind_rows(lapply(seq_len(nrow(sample_anchor_tbl)), function(i) {
+      anchor_row <- sample_anchor_tbl[i, , drop = FALSE]
+      fit_obj <- fit_fixed_mean_histogram_mixture(hist_tbl, build_flow_component_spec(anchor_row))
+      fit_obj$component_tbl %>%
+        transmute(
+          sample_name = sample_name,
+          draw_id = anchor_row$draw_id[[1]],
+          assigned_state = anchor_row$assigned_state[[1]],
+          component_index,
+          component_label,
+          constrained_location = mean,
+          weight,
+          sigma
+        )
+    }))
+  }))
+
+  sample_summary_tbl <- anchor_draw_tbl %>%
+    group_by(sample_name, condition, latest_match_date, relative_day) %>%
+    summarise(
+      posterior_prob_4n_subset = mean(prob_4n, na.rm = TRUE),
+      lower_anchor_median_subset = stats::median(lower_anchor, na.rm = TRUE),
+      upper_anchor_median_subset = stats::median(upper_anchor, na.rm = TRUE),
+      draw_ids = paste(sort(unique(draw_id)), collapse = ","),
+      .groups = "drop"
+    )
+
+  out_dir <- file.path(nuts_dir, "flow_only_distribution_trial")
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  draw_overlay_csv_path <- file.path(out_dir, "trial_draw_overlay_counts.csv")
+  component_draw_csv_path <- file.path(out_dir, "trial_component_draws.csv")
+  sample_summary_csv_path <- file.path(out_dir, "trial_sample_summary.csv")
+  overlay_plot_path <- file.path(out_dir, "trial_flow_distribution_overlays.png")
+
+  write.csv(draw_overlay_tbl, draw_overlay_csv_path, row.names = FALSE)
+  write.csv(component_draw_tbl, component_draw_csv_path, row.names = FALSE)
+  write.csv(sample_summary_tbl, sample_summary_csv_path, row.names = FALSE)
+  ggplot2::ggsave(
+    overlay_plot_path,
+    plot_flow_histogram_draw_overlays(draw_overlay_tbl),
+    width = 12,
+    height = 7,
+    dpi = 220
+  )
+
+  list(
+    spec = spec,
+    nuts_dir = nuts_dir,
+    out_dir = out_dir,
+    draw_overlay_tbl = draw_overlay_tbl,
+    component_draw_tbl = component_draw_tbl,
+    sample_summary_tbl = sample_summary_tbl,
+    draw_overlay_csv_path = draw_overlay_csv_path,
+    component_draw_csv_path = component_draw_csv_path,
+    sample_summary_csv_path = sample_summary_csv_path,
+    overlay_plot_path = overlay_plot_path
   )
 }

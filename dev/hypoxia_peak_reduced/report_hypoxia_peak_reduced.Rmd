@@ -14,6 +14,7 @@ library(knitr)
 report_file <- knitr::current_input(dir = TRUE)
 report_dir <- if (nzchar(report_file)) dirname(report_file) else file.path("dev", "hypoxia_peak_reduced")
 out_dir <- file.path(report_dir, "output")
+peak_drift_dir <- file.path(out_dir, "peak_drift")
 project_root <- normalizePath(file.path(report_dir, "..", ".."), winslash = "/", mustWork = TRUE)
 
 summary_tbl <- read.csv(
@@ -46,20 +47,14 @@ karyotype_lookup_tbl <- read.csv(
   check.names = FALSE
 )
 
-karyotype_ploidy_tbl <- read.csv(
-  file.path(out_dir, "karyotype_ploidy_summary.csv"),
+flow_only_g0g1_tbl <- read.csv(
+  file.path(out_dir, "extensions", "adjacent_8n_delta_dna", "nuts", "flow_only_distribution", "g0g1_ploidy_distribution_summary.csv"),
   stringsAsFactors = FALSE,
   check.names = FALSE
 )
 
-adjacent_8n_tbl <- read.csv(
-  file.path(out_dir, "extensions", "adjacent_8n", "sample_peak_summary.csv"),
-  stringsAsFactors = FALSE,
-  check.names = FALSE
-)
-
-adjacent_8n_delta_tbl <- read.csv(
-  file.path(out_dir, "extensions", "adjacent_8n_delta_dna", "sample_peak_summary.csv"),
+flow_only_g0g1_density_tbl <- read.csv(
+  file.path(out_dir, "extensions", "adjacent_8n_delta_dna", "nuts", "flow_only_distribution", "g0g1_ploidy_density_grid.csv"),
   stringsAsFactors = FALSE,
   check.names = FALSE
 )
@@ -67,6 +62,36 @@ adjacent_8n_delta_tbl <- read.csv(
 dna_vectors <- readRDS(
   file.path(project_root, "processed_data", "hypoxia-sum159", "filtered_dna_area_vectors.rds")
 )$raw
+
+peak_drift_event_tbl <- if (file.exists(file.path(peak_drift_dir, "event_window_peak_drift.csv"))) {
+  read.csv(
+    file.path(peak_drift_dir, "event_window_peak_drift.csv"),
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+} else {
+  NULL
+}
+
+peak_drift_time_tbl <- if (file.exists(file.path(peak_drift_dir, "time_window_peak_drift.csv"))) {
+  read.csv(
+    file.path(peak_drift_dir, "time_window_peak_drift.csv"),
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+} else {
+  NULL
+}
+
+peak_drift_config_tbl <- if (file.exists(file.path(peak_drift_dir, "peak_drift_config.csv"))) {
+  read.csv(
+    file.path(peak_drift_dir, "peak_drift_config.csv"),
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+} else {
+  NULL
+}
 
 sample_order_tbl <- summary_tbl %>%
   arrange(as.Date(latest_match_date), sample_name) %>%
@@ -84,35 +109,470 @@ sample_levels <- sample_order_tbl$sample_name
 sample_label_map <- setNames(sample_order_tbl$sample_label, sample_order_tbl$sample_name)
 outlier_palette <- c("Primary outlier" = "#cb181d", "Not primary outlier" = "#2171b5")
 
-state_flip_tbl <- summary_tbl %>%
-  select(sample_name, condition, latest_match_date, relative_day, observed_g1_peak, baseline_state = assigned_state) %>%
-  inner_join(
-    adjacent_8n_tbl %>%
-      select(sample_name, adjacent_8n_state = assigned_state, adjacent_8n_counterfactual = phi1_counterfactual_peak),
-    by = "sample_name"
-  ) %>%
-  inner_join(
-    adjacent_8n_delta_tbl %>%
-      select(sample_name, adjacent_8n_delta_state = assigned_state, adjacent_8n_delta_counterfactual = phi1_counterfactual_peak),
-    by = "sample_name"
-  ) %>%
-  filter(
-    baseline_state != adjacent_8n_state |
-      baseline_state != adjacent_8n_delta_state
-  ) %>%
-  arrange(relative_day, sample_name)
+comparison_tbl <- bind_rows(
+  ablation_tbl %>% mutate(model_family = "Ablation"),
+  extension_tbl %>% mutate(model_family = "Extension")
+) %>%
+  mutate(
+    free_parameter_count = as.numeric(free_parameter_count),
+    rmse_cen = as.numeric(rmse_cen),
+    rmse_g1 = as.numeric(rmse_g1),
+    ablation_name = factor(
+      ablation_name,
+      levels = c(
+        "baseline",
+        "no_date_effect",
+        "no_x_ratio_effect",
+        "rho_fixed_one",
+        "latent_u",
+        "delta_dna",
+        "adjacent_8n",
+        "adjacent_8n_delta_dna"
+      )
+    )
+  )
 
-plot_burden_vs_peak <- function(data, y_var, y_label, title) {
-  ggplot(data, aes(x = ratio_above_below, y = .data[[y_var]])) +
-    geom_point(aes(color = latest_match_date), size = 2.4, alpha = 0.9) +
+karyotype_vs_flow_tbl <- karyotype_lookup_tbl %>%
+  select(
+    karyo_id,
+    flow_sample_name,
+    flow_condition,
+    latest_match_date,
+    mapping_note,
+    mean_dna_ploidy_using_supplied_unidentified,
+    mean_dna_ploidy_using_average_unidentified
+  ) %>%
+  inner_join(
+    flow_only_g0g1_density_tbl %>%
+      mutate(
+        ploidy = as.numeric(ploidy),
+        log_density = as.numeric(log_density)
+      ) %>%
+      group_by(sample_name) %>%
+      mutate(density_weight = exp(log_density - max(log_density, na.rm = TRUE))) %>%
+      summarise(
+        mean_g0g1_ploidy = sum(ploidy * density_weight, na.rm = TRUE) / sum(density_weight, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      inner_join(
+        flow_only_g0g1_tbl %>%
+          transmute(sample_name, assigned_state_map),
+        by = "sample_name"
+      ),
+    by = c("flow_sample_name" = "sample_name")
+  )
+
+plot_model_rmse_vs_complexity <- function(comparison_tbl) {
+  plot_tbl <- bind_rows(
+    comparison_tbl %>%
+      transmute(
+        ablation_name,
+        model_family,
+        free_parameter_count,
+        peak_type = "CEN peak",
+        rmse = rmse_cen
+      ),
+    comparison_tbl %>%
+      transmute(
+        ablation_name,
+        model_family,
+        free_parameter_count,
+        peak_type = "G0/G1 peak",
+        rmse = rmse_g1
+      )
+  )
+
+  ggplot(plot_tbl, aes(x = free_parameter_count, y = rmse, color = ablation_name, shape = peak_type)) +
+    geom_point(size = 3, alpha = 0.9) +
     labs(
-      title = title,
-      x = "Burden proxy: ratio above / below",
-      y = y_label,
-      color = "Sample date"
+      title = "Model fit error versus free parameter count",
+      subtitle = "Ablations and extensions are shown together; point shape separates the CEN and G0/G1 error targets.",
+      x = "Free parameter count",
+      y = "RMSE",
+      color = "Model",
+      shape = NULL
     ) +
     theme_bw(base_size = 10) +
-    theme(panel.grid.minor = element_blank())
+    theme(
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom"
+    )
+}
+
+plot_karyotype_vs_flow_ploidy <- function(karyotype_vs_flow_tbl, karyotype_col = "mean_dna_ploidy_using_average_unidentified") {
+  ggplot(
+    karyotype_vs_flow_tbl,
+    aes(x = .data[[karyotype_col]], y = mean_g0g1_ploidy, color = assigned_state_map)
+  ) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50", linewidth = 0.4) +
+    geom_point(size = 2.6, alpha = 0.9) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.6) +
+    geom_text(aes(label = flow_condition), nudge_y = 0.03, size = 2.7, show.legend = FALSE) +
+    coord_equal() +
+    scale_color_manual(values = c("2N" = "#1b9e77", "4N" = "#d95f02")) +
+    labs(
+      title = "Karyotype mean ploidy versus flow-derived mean G0/G1 ploidy",
+      subtitle = "Flow ploidy is the posterior mean over the saved G0/G1 ploidy density grid from the adjacent_8n_delta_dna flow-only run.",
+      x = "Mean karyotype-derived DNA ploidy",
+      y = "Mean flow-derived G0/G1 ploidy",
+      color = "Assigned state"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom"
+    )
+}
+
+plot_burden_vs_peak <- function(data, y_var, y_label, title, x_var = "ratio_above_below", x_label = "Burden proxy: ratio above / below", shape_var = NULL, line_var = NULL) {
+  plot_tbl <- data %>%
+    transmute(
+      latest_match_date,
+      burden_proxy = as.numeric(.data[[x_var]]),
+      peak_value = as.numeric(.data[[y_var]]),
+      shape_group = if (is.null(shape_var)) "All samples" else .data[[shape_var]],
+      line_group = if (is.null(line_var)) "All samples" else .data[[line_var]]
+    ) %>%
+    filter(is.finite(burden_proxy), is.finite(peak_value), burden_proxy > 0, peak_value > 0) %>%
+    mutate(
+      latest_match_date = factor(latest_match_date, levels = sort(unique(latest_match_date))),
+      shape_group = factor(shape_group),
+      line_group = factor(line_group)
+    )
+
+  plot_obj <- ggplot(plot_tbl, aes(x = burden_proxy, y = peak_value)) +
+    geom_point(aes(color = latest_match_date, shape = shape_group), size = 2.4, alpha = 0.9) +
+    scale_x_log10(labels = label_number()) +
+    scale_y_log10(labels = label_number(big.mark = ",")) +
+    labs(
+      title = title,
+      x = x_label,
+      y = y_label,
+      color = "Sample date",
+      shape = if (is.null(shape_var)) NULL else "Baseline class",
+      linetype = if (is.null(line_var)) NULL else "Baseline class"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom"
+    )
+
+  if (is.null(line_var)) {
+    plot_obj +
+      geom_smooth(method = "lm", se = FALSE, linewidth = 0.7, color = "black") +
+      guides(
+        shape = if (is.null(shape_var)) "none" else guide_legend(order = 2),
+        linetype = "none",
+        color = guide_legend(order = 1)
+      )
+  } else {
+    plot_obj +
+      geom_smooth(
+        aes(linetype = line_group, group = line_group),
+        method = "lm",
+        se = FALSE,
+        linewidth = 0.7,
+        color = "black"
+      ) +
+      guides(
+        color = guide_legend(order = 1),
+        shape = guide_legend(order = 2),
+        linetype = guide_legend(order = 3)
+      )
+  }
+}
+
+build_date_scaled_peak_tbl <- function(data, y_var, x_var = "ratio_above_below", class_var = "assigned_state") {
+  plot_tbl <- data %>%
+    transmute(
+      sample_name,
+      condition,
+      latest_match_date,
+      burden_proxy = as.numeric(.data[[x_var]]),
+      peak_value = as.numeric(.data[[y_var]]),
+      class_group = .data[[class_var]]
+    ) %>%
+    filter(
+      is.finite(burden_proxy),
+      is.finite(peak_value),
+      burden_proxy > 0,
+      peak_value > 0
+    ) %>%
+    mutate(
+      latest_match_date = factor(latest_match_date, levels = sort(unique(latest_match_date))),
+      class_group = factor(class_group)
+    )
+
+  class_fit_tbl <- bind_rows(lapply(levels(plot_tbl$class_group), function(class_name) {
+    class_data <- plot_tbl %>% filter(class_group == class_name)
+    fit <- lm(log(peak_value) ~ log(burden_proxy), data = class_data)
+    tibble(
+      class_group = factor(class_name, levels = levels(plot_tbl$class_group)),
+      intercept = unname(coef(fit)[1]),
+      slope = unname(coef(fit)[2])
+    )
+  }))
+
+  scaled_tbl <- plot_tbl %>%
+    left_join(class_fit_tbl, by = "class_group") %>%
+    mutate(
+      pred_log_peak = intercept + slope * log(burden_proxy),
+      fitted_peak = exp(pred_log_peak)
+    ) %>%
+    group_by(latest_match_date) %>%
+    mutate(
+      date_log_scale = mean(log(peak_value) - pred_log_peak, na.rm = TRUE),
+      date_scale_factor = exp(date_log_scale),
+      scaled_peak_value = peak_value / date_scale_factor
+    ) %>%
+    ungroup() %>%
+    mutate(
+      class_anchor_ploidy = if_else(class_group == "4N", 4, 2),
+      raw_class_mean_peak = ave(peak_value, class_group, FUN = mean),
+      date_scaled_class_mean_peak = ave(scaled_peak_value, class_group, FUN = mean),
+      normalized_ploidy_raw = class_anchor_ploidy * peak_value / raw_class_mean_peak,
+      normalized_ploidy_date_scaled = class_anchor_ploidy * scaled_peak_value / date_scaled_class_mean_peak,
+      normalized_ploidy_date_burden = class_anchor_ploidy * scaled_peak_value / fitted_peak
+    ) %>%
+    inner_join(sample_order_tbl %>% select(sample_name, sample_label), by = "sample_name") %>%
+    mutate(sample_name = factor(sample_name, levels = sample_levels))
+
+  line_tbl <- expand.grid(
+    class_group = levels(plot_tbl$class_group),
+    burden_proxy = seq(
+      min(plot_tbl$burden_proxy),
+      max(plot_tbl$burden_proxy),
+      length.out = 200
+    ),
+    stringsAsFactors = FALSE
+  ) %>%
+    as_tibble() %>%
+    mutate(class_group = factor(class_group, levels = levels(plot_tbl$class_group))) %>%
+    left_join(class_fit_tbl, by = "class_group") %>%
+    mutate(fitted_peak = exp(intercept + slope * log(burden_proxy)))
+
+  list(
+    scaled_tbl = scaled_tbl,
+    line_tbl = line_tbl,
+    class_fit_tbl = class_fit_tbl
+  )
+}
+
+plot_burden_with_date_scaling <- function(data, y_var, y_label, title, x_var = "ratio_above_below", x_label = "Burden proxy: ratio above / below", class_var = "assigned_state") {
+  plot_parts <- build_date_scaled_peak_tbl(data, y_var, x_var = x_var, class_var = class_var)
+  scaled_tbl <- plot_parts$scaled_tbl
+  line_tbl <- plot_parts$line_tbl
+
+  ggplot(scaled_tbl, aes(x = burden_proxy, y = scaled_peak_value)) +
+    geom_line(
+      data = line_tbl,
+      aes(y = fitted_peak, linetype = class_group),
+      color = "black",
+      linewidth = 0.7
+    ) +
+    geom_point(aes(color = latest_match_date, shape = class_group), size = 2.4, alpha = 0.9) +
+    scale_x_log10(labels = label_number()) +
+    scale_y_log10(labels = label_number(big.mark = ",")) +
+    labs(
+      title = title,
+      subtitle = "Each date group is rescaled by one multiplicative factor chosen to minimize squared log-error against the original class-specific regression lines.",
+      x = x_label,
+      y = y_label,
+      color = "Sample date",
+      shape = "Baseline class",
+      linetype = "Baseline class"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom"
+    )
+}
+
+build_ploidy_position_long_tbl <- function(data, y_var, x_var = "ratio_above_below", class_var = "assigned_state") {
+  scaled_tbl <- build_date_scaled_peak_tbl(data, y_var, x_var = x_var, class_var = class_var)$scaled_tbl
+
+  bind_rows(
+    scaled_tbl %>%
+      transmute(
+        sample_name,
+        sample_label,
+        latest_match_date,
+        class_group,
+        class_anchor_ploidy,
+        panel = "A. Raw / class mean",
+        normalized_ploidy = normalized_ploidy_raw
+      ),
+    scaled_tbl %>%
+      transmute(
+        sample_name,
+        sample_label,
+        latest_match_date,
+        class_group,
+        class_anchor_ploidy,
+        panel = "B. Date-scaled / class mean",
+        normalized_ploidy = normalized_ploidy_date_scaled
+      ),
+    scaled_tbl %>%
+      transmute(
+        sample_name,
+        sample_label,
+        latest_match_date,
+        class_group,
+        class_anchor_ploidy,
+        panel = "C. Date + burden normalized",
+        normalized_ploidy = normalized_ploidy_date_burden
+      )
+  ) %>%
+    mutate(
+      panel = factor(
+        panel,
+        levels = c(
+          "A. Raw / class mean",
+          "B. Date-scaled / class mean",
+          "C. Date + burden normalized"
+        )
+      ),
+      sample_id = factor(sample_name, levels = rev(sample_levels)),
+      centered_ploidy = normalized_ploidy - class_anchor_ploidy
+    )
+}
+
+plot_ploidy_position_panels <- function(data, y_var, title, x_var = "ratio_above_below", class_var = "assigned_state") {
+  plot_tbl <- build_ploidy_position_long_tbl(data, y_var, x_var = x_var, class_var = class_var)
+
+  ggplot(plot_tbl, aes(x = normalized_ploidy, y = sample_id)) +
+    geom_vline(xintercept = c(2, 4), linetype = "dashed", color = "grey45", linewidth = 0.5) +
+    geom_point(aes(color = latest_match_date, shape = class_group), size = 2.6, alpha = 0.9) +
+    facet_wrap(~ panel, ncol = 3) +
+    scale_y_discrete(labels = rev(unname(sample_label_map[as.character(sample_levels)]))) +
+    scale_x_continuous(breaks = c(1.5, 2, 2.5, 3, 3.5, 4, 4.5)) +
+    labs(
+      title = title,
+      subtitle = "Panels compare raw class-mean normalization, date-only scaling, and date-plus-burden normalization. Dashed lines mark the 2N and 4N reference positions.",
+      x = "Normalized ploidy position",
+      y = NULL,
+      color = "Sample date",
+      shape = "Baseline class"
+    ) +
+    theme_bw(base_size = 9) +
+    theme(
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom",
+      strip.background = element_rect(fill = "grey95", color = "grey80")
+    )
+}
+
+plot_ploidy_sd_panels <- function(data, y_var, title, x_var = "ratio_above_below", class_var = "assigned_state") {
+  plot_tbl <- build_ploidy_position_long_tbl(data, y_var, x_var = x_var, class_var = class_var)
+
+  panel_label_tbl <- plot_tbl %>%
+    group_by(panel) %>%
+    summarise(
+      sd_2n = sd(centered_ploidy[class_group == "2N"], na.rm = TRUE),
+      sd_4n = sd(centered_ploidy[class_group == "4N"], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      panel_label = sprintf(
+        "%s\n%s, %s",
+        panel,
+        sprintf("SD(2N)=%.3f", sd_2n),
+        sprintf("SD(4N)=%.3f", sd_4n)
+      )
+    )
+
+  panel_labeller <- setNames(panel_label_tbl$panel_label, panel_label_tbl$panel)
+
+  ggplot(plot_tbl, aes(x = class_group, y = centered_ploidy)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey45", linewidth = 0.5) +
+    geom_violin(aes(fill = class_group), alpha = 0.18, color = NA, width = 0.9) +
+    geom_jitter(aes(color = latest_match_date), width = 0.12, height = 0, size = 2.1, alpha = 0.9) +
+    facet_wrap(~ panel, ncol = 3, labeller = as_labeller(panel_labeller)) +
+    scale_fill_manual(values = c("2N" = "#1b9e77", "4N" = "#d95f02")) +
+    labs(
+      title = title,
+      subtitle = "Centered ploidy displacement from each class anchor (2N or 4N). Facet labels report within-class SD for each normalization scheme.",
+      x = "Baseline class",
+      y = "Centered normalized ploidy",
+      color = "Sample date",
+      fill = "Baseline class"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom",
+      strip.background = element_rect(fill = "grey95", color = "grey80")
+    )
+}
+
+plot_tumor_peak_ratio_vs_cen <- function(summary_tbl, input_tbl, title) {
+  plot_tbl <- input_tbl %>%
+    select(sample_name, cen_peak, tumor_peak_1, tumor_peak_2) %>%
+    inner_join(
+      summary_tbl %>% select(sample_name, latest_match_date, assigned_state, is_primary_outlier),
+      by = "sample_name"
+    ) %>%
+    transmute(
+      sample_name,
+      latest_match_date = factor(latest_match_date, levels = sort(unique(latest_match_date))),
+      assigned_state = factor(assigned_state),
+      is_primary_outlier,
+      cen_peak = as.numeric(cen_peak),
+      tumor_peak_ratio = as.numeric(tumor_peak_2) / as.numeric(tumor_peak_1)
+    ) %>%
+    filter(
+      !is_primary_outlier,
+      is.finite(cen_peak),
+      is.finite(tumor_peak_ratio),
+      cen_peak > 0,
+      tumor_peak_ratio > 0
+    )
+
+  fit_stats_tbl <- bind_rows(lapply(levels(plot_tbl$assigned_state), function(class_name) {
+    class_tbl <- plot_tbl %>% filter(assigned_state == class_name)
+    fit <- lm(tumor_peak_ratio ~ cen_peak, data = class_tbl)
+    tibble(
+      assigned_state = factor(class_name, levels = levels(plot_tbl$assigned_state)),
+      slope = unname(coef(fit)["cen_peak"]),
+      r2 = summary(fit)$r.squared
+    )
+  }))
+
+  annotation_tbl <- fit_stats_tbl %>%
+    mutate(
+      x = min(plot_tbl$cen_peak) * 1.02,
+      y = seq(max(plot_tbl$tumor_peak_ratio) * 0.98, max(plot_tbl$tumor_peak_ratio) * 0.84, length.out = n()),
+      label = sprintf("%s: slope = %.4g, R^2 = %.3f", assigned_state, slope, r2)
+    )
+
+  ggplot(plot_tbl, aes(x = cen_peak, y = tumor_peak_ratio)) +
+    geom_smooth(aes(linetype = assigned_state, group = assigned_state), method = "lm", se = FALSE, color = "black", linewidth = 0.7) +
+    geom_point(aes(color = latest_match_date, shape = assigned_state), size = 2.4, alpha = 0.9) +
+    geom_label(
+      data = annotation_tbl,
+      aes(x = x, y = y, label = label),
+      inherit.aes = FALSE,
+      hjust = 0,
+      vjust = 1,
+      size = 3,
+      label.size = 0.2
+    ) +
+    scale_x_log10(labels = label_number(big.mark = ",")) +
+    labs(
+      title = title,
+      x = "Observed CEN peak",
+      y = "Observed tumor peak 2 / tumor peak 1",
+      color = "Sample date",
+      shape = "Baseline class",
+      linetype = "Baseline class"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom"
+    )
 }
 
 plot_peak_ratio_by_sample <- function(summary_tbl, input_tbl) {
@@ -220,6 +680,139 @@ plot_sample_dna_histograms <- function(summary_tbl, input_tbl, dna_vectors) {
       legend.position = "bottom"
     )
 }
+
+reshape_peak_drift_long <- function(peak_drift_tbl) {
+  if (is.null(peak_drift_tbl) || !nrow(peak_drift_tbl)) {
+    return(tibble())
+  }
+
+  peak_drift_tbl <- peak_drift_tbl %>%
+    mutate(sample_name = sub("\\.fcs$", "", sample_name))
+
+  bind_rows(
+    peak_drift_tbl %>%
+      transmute(
+        sample_name,
+        latest_match_date,
+        relative_day,
+        window_mid_fraction,
+        time_mid_s = if ("time_mid_s" %in% names(peak_drift_tbl)) time_mid_s else NA_real_,
+        peak_type = "CEN peak",
+        peak_location = cen_peak,
+        overall_peak = overall_cen_peak
+      ),
+    peak_drift_tbl %>%
+      transmute(
+        sample_name,
+        latest_match_date,
+        relative_day,
+        window_mid_fraction,
+        time_mid_s = if ("time_mid_s" %in% names(peak_drift_tbl)) time_mid_s else NA_real_,
+        peak_type = "Tumor peak 1",
+        peak_location = tumor_peak_1,
+        overall_peak = overall_tumor_peak_1
+      ),
+    peak_drift_tbl %>%
+      transmute(
+        sample_name,
+        latest_match_date,
+        relative_day,
+        window_mid_fraction,
+        time_mid_s = if ("time_mid_s" %in% names(peak_drift_tbl)) time_mid_s else NA_real_,
+        peak_type = "Tumor peak 2",
+        peak_location = tumor_peak_2,
+        overall_peak = overall_tumor_peak_2
+      )
+  ) %>%
+    filter(is.finite(peak_location)) %>%
+    inner_join(sample_order_tbl, by = "sample_name") %>%
+    mutate(sample_name = factor(sample_name, levels = sample_levels))
+}
+
+plot_peak_drift_progression <- function(peak_drift_tbl, x_var = c("window_mid_fraction", "time_mid_s"), title, x_label, subtitle = NULL) {
+  x_var <- match.arg(x_var)
+  plot_tbl <- reshape_peak_drift_long(peak_drift_tbl)
+  if (!nrow(plot_tbl)) {
+    return(
+      ggplot() +
+        annotate("text", x = 1, y = 1, label = "Peak drift output not available for this view.") +
+        theme_void()
+    )
+  }
+
+  ggplot(plot_tbl, aes(x = .data[[x_var]], y = peak_location, color = peak_type, group = peak_type)) +
+    geom_hline(aes(yintercept = overall_peak, color = peak_type), linetype = "dashed", linewidth = 0.35, alpha = 0.5) +
+    geom_line(linewidth = 0.5, alpha = 0.9) +
+    geom_point(size = 0.9, alpha = 0.85) +
+    facet_wrap(~ sample_name, scales = "free_y", ncol = 4, labeller = as_labeller(sample_label_map)) +
+    scale_color_manual(
+      values = c(
+        "CEN peak" = "#1b9e77",
+        "Tumor peak 1" = "#d95f02",
+        "Tumor peak 2" = "#7570b3"
+      )
+    ) +
+    scale_x_continuous(labels = label_percent(accuracy = 1)) +
+    scale_y_log10(
+      breaks = c(5000, 10000, 20000, 40000, 80000),
+      labels = label_number(big.mark = ",")
+    ) +
+    labs(
+      title = title,
+      subtitle = subtitle,
+      x = x_label,
+      y = "Estimated peak location",
+      color = NULL
+    ) +
+    theme_bw(base_size = 9) +
+    theme(
+      panel.grid.minor = element_blank(),
+      strip.text = element_text(size = 8),
+      legend.position = "bottom"
+    )
+}
+
+plot_peak_drift_time_seconds <- function(peak_drift_tbl) {
+  plot_tbl <- reshape_peak_drift_long(peak_drift_tbl)
+  if (!nrow(plot_tbl) || all(!is.finite(plot_tbl$time_mid_s))) {
+    return(
+      ggplot() +
+        annotate("text", x = 1, y = 1, label = "Time-window peak drift is not available.") +
+        theme_void()
+    )
+  }
+
+  ggplot(plot_tbl, aes(x = time_mid_s, y = peak_location, color = peak_type, group = peak_type)) +
+    geom_hline(aes(yintercept = overall_peak, color = peak_type), linetype = "dashed", linewidth = 0.35, alpha = 0.5) +
+    geom_line(linewidth = 0.5, alpha = 0.9) +
+    geom_point(size = 0.9, alpha = 0.85) +
+    facet_wrap(~ sample_name, scales = "free_y", ncol = 4, labeller = as_labeller(sample_label_map)) +
+    scale_color_manual(
+      values = c(
+        "CEN peak" = "#1b9e77",
+        "Tumor peak 1" = "#d95f02",
+        "Tumor peak 2" = "#7570b3"
+      )
+    ) +
+    scale_x_continuous(labels = label_number(accuracy = 1)) +
+    scale_y_log10(
+      breaks = c(5000, 10000, 20000, 40000, 80000),
+      labels = label_number(big.mark = ",")
+    ) +
+    labs(
+      title = "Peak drift by acquisition time",
+      subtitle = "Dashed lines show the whole-run peak estimates. Solid trajectories come from overlapping time windows.",
+      x = "Window midpoint time (seconds)",
+      y = "Estimated peak location",
+      color = NULL
+    ) +
+    theme_bw(base_size = 9) +
+    theme(
+      panel.grid.minor = element_blank(),
+      strip.text = element_text(size = 8),
+      legend.position = "bottom"
+    )
+}
 ```
 
 # Data
@@ -240,90 +833,41 @@ the burden effect changes the fit much less, and fixing `rho = 1` is nearly
 irrelevant at this checkpoint.
 
 Among the extensions, a pure adjacent-state reinterpretation appears too
-aggressive because it relabels some late 4N samples as 2N. The combined
-`adjacent_8n_delta_dna` model is more plausible because it keeps the late 4N
-samples as 4N while reassigning only a smaller subset of ambiguous O2 samples.
+aggressive because it pulls some ambiguous O2 samples all the way onto the 4N
+track. The combined `adjacent_8n_delta_dna` model remains the more defensible
+version because it allows limited state reinterpretation while still tracking
+the observed peak geometry more closely than the plain adjacent-state model.
 
-# Ablations
+# Model Comparison
 
-```{r ablation-table}
-ablation_tbl %>%
-  mutate(
-    objective_lp = round(objective_lp, 2),
-    rmse_cen = round(rmse_cen, 1),
-    rmse_g1 = round(rmse_g1, 1),
-    cor_counterfactual_vs_burden = round(cor_counterfactual_vs_burden, 3),
-    mean_phi_date = round(mean_phi_date, 3),
-    sd_phi_date = round(sd_phi_date, 3)
-  ) %>%
-  arrange(desc(include_date_effect), desc(include_x_ratio_effect), rho_fixed_one) %>%
-  kable()
+```{r model-comparison-scatter, fig.width=9, fig.height=5.5}
+plot_model_rmse_vs_complexity(comparison_tbl)
 ```
 
-# Extensions
+The comparison still points to the same main conclusion: dropping the date
+effect is the clear failure mode for G0/G1 fit, while the combined
+`adjacent_8n_delta_dna` extension improves CEN fit but pays for that flexibility
+with a worse lower-peak RMSE than the baseline model.
 
-```{r extension-table}
-extension_tbl %>%
-  mutate(
-    objective_lp = round(objective_lp, 2),
-    rmse_cen = round(rmse_cen, 1),
-    rmse_g1 = round(rmse_g1, 1),
-    cor_counterfactual_vs_burden = round(cor_counterfactual_vs_burden, 3),
-    mean_phi_date = round(mean_phi_date, 3),
-    sd_phi_date = round(sd_phi_date, 3)
-  ) %>%
-  kable()
+# Baseline Counterfactual
+
+The baseline fit still implies a date-dependent counterfactual shift in the
+lower peak, so the saved baseline counterfactual diagnostic remains useful to
+show explicitly in the report.
+
+```{r baseline-phi-counterfactual, fig.width=8, fig.height=5}
+knitr::include_graphics(file.path(out_dir, "phi_counterfactual.png"))
 ```
-
-# State Reassignments
-
-The table below isolates the samples whose lower-peak state assignment changes
-relative to the baseline model.
-
-```{r state-flips}
-state_flip_tbl %>%
-  mutate(
-    observed_g1_peak = round(observed_g1_peak, 1),
-    adjacent_8n_counterfactual = round(adjacent_8n_counterfactual, 1),
-    adjacent_8n_delta_counterfactual = round(adjacent_8n_delta_counterfactual, 1)
-  ) %>%
-  kable()
-```
-
-This is the main reason the combined model is easier to defend than
-`adjacent_8n` alone: the plain adjacent-state model also relabels the late
-`4N_O1_A22` and `4N_O2_A22` samples as 2N, whereas the combined model leaves
-those late 4N samples alone and only flips the two more ambiguous O2 samples
-(`2N_O2_A18` and `2N_O2_A23`).
 
 # Karyotype Link
 
-These karyotype summaries do not prove the flow-state interpretation, but they
-do make the O2 ambiguity biologically more interesting rather than purely a
-fitting artifact.
+These matched karyotype summaries do not prove the flow-state interpretation,
+but they do help distinguish samples that are merely difficult to fit from
+samples whose ambiguous lower peak also coincides with elevated inferred DNA
+ploidy.
 
-```{r karyotype-summary}
-karyotype_ploidy_tbl %>%
-  mutate(
-    mean_dna_ploidy_using_supplied_unidentified = round(mean_dna_ploidy_using_supplied_unidentified, 3),
-    sd_dna_ploidy_using_supplied_unidentified = round(sd_dna_ploidy_using_supplied_unidentified, 3),
-    mean_dna_ploidy_using_average_unidentified = round(mean_dna_ploidy_using_average_unidentified, 3),
-    sd_dna_ploidy_using_average_unidentified = round(sd_dna_ploidy_using_average_unidentified, 3)
-  ) %>%
-  kable()
-```
-
-```{r karyotype-lookup}
-karyotype_lookup_tbl %>%
-  select(
-    karyo_id,
-    flow_sample_name,
-    flow_condition,
-    mapping_note,
-    mean_dna_ploidy_using_supplied_unidentified
-  ) %>%
-  mutate(mean_dna_ploidy_using_supplied_unidentified = round(mean_dna_ploidy_using_supplied_unidentified, 3)) %>%
-  kable()
+```{r karyotype-vs-flow-ploidy, fig.width=7.5, fig.height=6}
+plot_karyotype_vs_flow_ploidy(karyotype_vs_flow_tbl)
 ```
 
 # Peak Histograms
@@ -332,20 +876,18 @@ karyotype_lookup_tbl %>%
 plot_sample_dna_histograms(summary_tbl, input_tbl, dna_vectors)
 ```
 
-# Peak Ratio
-
-```{r peak-ratio-by-sample, fig.width=10, fig.height=7}
-plot_peak_ratio_by_sample(summary_tbl, input_tbl)
-```
-
-# Burden Proxy Plots
+# Burden Proxy Plots: Fluorescence Ratio
 
 ```{r observed-g1-vs-burden, fig.width=7, fig.height=4.5}
 plot_burden_vs_peak(
   summary_tbl,
   y_var = "observed_g1_peak",
   y_label = "Observed G0/G1 peak",
-  title = "Observed G0/G1 peak vs burden proxy"
+  title = "Observed G0/G1 peak vs burden proxy",
+  x_var = "ratio_above_below",
+  x_label = "Burden proxy: fluorescence ratio above / below",
+  shape_var = "assigned_state",
+  line_var = "assigned_state"
 )
 ```
 
@@ -354,20 +896,159 @@ plot_burden_vs_peak(
   summary_tbl,
   y_var = "cen_peak",
   y_label = "Observed CEN peak",
-  title = "Observed CEN peak vs burden proxy"
+  title = "Observed CEN peak vs burden proxy",
+  x_var = "ratio_above_below",
+  x_label = "Burden proxy: fluorescence ratio above / below",
+  shape_var = "assigned_state"
 )
 ```
 
-```{r counterfactual-g1-vs-burden, fig.width=7, fig.height=4.5}
-plot_burden_vs_peak(
+```{r observed-g1-vs-burden-date-scaled, fig.width=7.5, fig.height=4.8}
+plot_burden_with_date_scaling(
   summary_tbl,
-  y_var = "phi1_counterfactual_peak",
-  y_label = "Counterfactual G0/G1 peak",
-  title = "Counterfactual G0/G1 peak vs burden proxy"
+  y_var = "observed_g1_peak",
+  y_label = "Date-scaled observed G0/G1 peak",
+  title = "Observed G0/G1 peak vs burden proxy after per-date scaling",
+  x_var = "ratio_above_below",
+  x_label = "Burden proxy: fluorescence ratio above / below"
+)
+```
+
+```{r ploidy-position-panels, fig.width=15, fig.height=8}
+plot_ploidy_position_panels(
+  summary_tbl,
+  y_var = "observed_g1_peak",
+  title = "Per-sample normalized ploidy positions under three normalization schemes",
+  x_var = "ratio_above_below"
+)
+```
+
+```{r ploidy-sd-panels, fig.width=15, fig.height=5.5}
+plot_ploidy_sd_panels(
+  summary_tbl,
+  y_var = "observed_g1_peak",
+  title = "Spread around class anchors under three normalization schemes",
+  x_var = "ratio_above_below"
+)
+```
+
+```{r tumor-peak-ratio-vs-cen, fig.width=7.5, fig.height=5}
+plot_tumor_peak_ratio_vs_cen(
+  summary_tbl,
+  input_tbl,
+  title = "Tumor peak ratio versus CEN peak"
 )
 ```
 
 The burden plots remain useful descriptively, but they are no longer the main
-interpretive result of this checkpoint. The current comparison tables argue more
-strongly for a persistent date effect and for a narrower adjacent-state-plus-
-`delta_dna` explanation in a subset of ambiguous samples.
+interpretive result of this checkpoint. On log-log axes the CEN relationship
+looks closer to a single monotone trend, whereas the observed G0/G1 peak still
+separates into distinct 2N and 4N regimes. The follow-up G0/G1 panel asks how
+much of the date-level spread can be absorbed by a single multiplicative shift
+per date group while preserving the already fitted class-specific burden
+slopes. The two faceted ploidy panels then compare raw, date-only, and
+date-plus-burden normalization on the same 2N/4N anchor scale and summarize
+how much within-class spread remains under each scheme.
+
+# Burden Proxy Plots: DNA-Singlet Count Ratio
+
+```{r observed-g1-vs-count-burden, fig.width=7, fig.height=4.5}
+plot_burden_vs_peak(
+  summary_tbl,
+  y_var = "observed_g1_peak",
+  y_label = "Observed G0/G1 peak",
+  title = "Observed G0/G1 peak vs burden proxy",
+  x_var = "count_ratio_above_below",
+  x_label = "Burden proxy: DNA singlet count ratio above / below",
+  shape_var = "assigned_state",
+  line_var = "assigned_state"
+)
+```
+
+```{r observed-cen-vs-count-burden, fig.width=7, fig.height=4.5}
+plot_burden_vs_peak(
+  summary_tbl,
+  y_var = "cen_peak",
+  y_label = "Observed CEN peak",
+  title = "Observed CEN peak vs burden proxy",
+  x_var = "count_ratio_above_below",
+  x_label = "Burden proxy: DNA singlet count ratio above / below",
+  shape_var = "assigned_state"
+)
+```
+
+```{r observed-g1-vs-count-burden-date-scaled, fig.width=7.5, fig.height=4.8}
+plot_burden_with_date_scaling(
+  summary_tbl,
+  y_var = "observed_g1_peak",
+  y_label = "Date-scaled observed G0/G1 peak",
+  title = "Observed G0/G1 peak vs burden proxy after per-date scaling",
+  x_var = "count_ratio_above_below",
+  x_label = "Burden proxy: DNA singlet count ratio above / below"
+)
+```
+
+```{r count-burden-ploidy-position-panels, fig.width=15, fig.height=8}
+plot_ploidy_position_panels(
+  summary_tbl,
+  y_var = "observed_g1_peak",
+  title = "Per-sample normalized ploidy positions under three normalization schemes",
+  x_var = "count_ratio_above_below"
+)
+```
+
+```{r count-burden-ploidy-sd-panels, fig.width=15, fig.height=5.5}
+plot_ploidy_sd_panels(
+  summary_tbl,
+  y_var = "observed_g1_peak",
+  title = "Spread around class anchors under three normalization schemes",
+  x_var = "count_ratio_above_below"
+)
+```
+
+This second block keeps the same descriptive pipeline but swaps in the
+above/below ratio of DNA-singlet objects. That makes it easier to judge which
+parts of the visual structure are robust to the burden-proxy definition and
+which depend on using fluorescence intensity rather than object counts.
+
+# Appendix
+
+## Within-Run Peak Drift
+
+The checkpoint outputs now include a sliding-window re-estimation of the CEN
+peak and the two above-threshold tumor peaks within each run. These diagnostics
+are still useful for ruling out acquisition artifacts, but they are secondary to
+the cross-sample model comparison.
+
+```{r peak-drift-event-progression, fig.width=14, fig.height=12}
+plot_peak_drift_progression(
+  peak_drift_event_tbl,
+  x_var = "window_mid_fraction",
+  title = "Peak drift by within-run event progression",
+  subtitle = "Dashed lines show the whole-run peak estimates. Solid trajectories come from overlapping 10,000-event windows stepped by 2,500 events.",
+  x_label = "Window midpoint / total acquired events"
+)
+```
+
+If a valid FCS `Time` channel is available, the same peak re-estimation can
+also be viewed on true acquisition time windows.
+
+```{r peak-drift-time-progression, fig.width=14, fig.height=12}
+plot_peak_drift_progression(
+  peak_drift_time_tbl,
+  x_var = "window_mid_fraction",
+  title = "Peak drift by within-run time progression",
+  subtitle = "This panel appears only when the saved gates plus source FCS files recover a valid Time channel. The x-axis is normalized acquisition time.",
+  x_label = "Window midpoint / total acquisition time"
+)
+```
+
+```{r peak-drift-time-seconds, fig.width=14, fig.height=12}
+plot_peak_drift_time_seconds(peak_drift_time_tbl)
+```
+
+## Peak Ratio
+
+```{r peak-ratio-by-sample, fig.width=10, fig.height=7}
+plot_peak_ratio_by_sample(summary_tbl, input_tbl)
+```

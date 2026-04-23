@@ -87,6 +87,8 @@ not yet represented.
   checkpoint report
 - `R/run_fit.R`: canonical fit runner
 - `R/fit_specs.R`: canonical preserved fit specifications
+- `R/run_kde_peak_stability.R`: KDE peak stability runner for filtered singlet
+  DNA vectors
 
 Run the current preserved fits with:
 
@@ -95,6 +97,24 @@ Rscript R/run_fit.R first_pass
 Rscript R/run_fit.R dye_ratio
 Rscript R/run_fit.R observed_cen_scaled
 ```
+
+Run KDE peak stability detection across the three main cached filtered DNA
+exports with:
+
+```text
+Rscript R/run_kde_peak_stability.R --datasets anoxia-flowcytometry,hypoxia-sum159,polyploidization-ethanolfixation --output-root processed_data/kde_peak_stability_by_dataset
+```
+
+By default this uses raw filtered DNA values for output, log10-transformed DNA
+values for KDE peak detection, local per-sample `bw.SJ` base bandwidths,
+bandwidth multipliers `0.70,0.85,1.00,1.15,1.30`, `min_relative_height = 0.01`,
+`min_relative_prominence = 0.008`, and keeps peaks supported in at least 4 of
+the 5 bandwidth settings. Each dataset output folder contains `peaks.csv`,
+`diagnostics.csv`, `sample_summary.csv`, and an `overlays/` folder with raw DNA
+histograms and stable peak locations marked as vertical lines. Alternative
+thresholds and bandwidth strategies can be tested with flags such as
+`--min-relative-height`, `--min-relative-prominence`, `--bandwidth-method nrd0`,
+or `--global-bandwidth median-sample`.
 
 ## Repository Structure
 

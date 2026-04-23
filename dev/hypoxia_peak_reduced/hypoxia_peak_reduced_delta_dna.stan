@@ -5,6 +5,7 @@ data {
   vector[N] x_ratio;
   vector<lower=0>[N] y_cen;
   vector<lower=0>[N] y_g1;
+  real<lower=0> sigma_delta_dna_prior_scale;
 }
 
 parameters {
@@ -55,7 +56,7 @@ model {
   log_R_4n_over_2n ~ normal(log(2), 0.2);
   log_rho ~ normal(0, 0.5);
   log_phi_raw ~ normal(0, 0.35);
-  sigma_delta_dna ~ normal(0, 0.1);
+  sigma_delta_dna ~ normal(0, sigma_delta_dna_prior_scale);
   delta_dna ~ normal(0, sigma_delta_dna);
   sigma_cen ~ normal(0, 0.15);
   sigma_g1 ~ normal(0, 0.15);

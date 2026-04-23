@@ -29,7 +29,9 @@ knitr::opts_chunk$set(
 This document runs the gating workflow independently for each dataset directory
 under `data/`. Each dataset gets its own cache under `processed_data/` and its
 own figure namespace under `figure/`, so additional datasets can be added
-without colliding with existing outputs.
+without colliding with existing outputs. The current inventory includes the
+`Polyploidization_EthanolFixation` dataset alongside the anoxia and hypoxia
+collections.
 
 ```{r load-js, results='asis'}
 cat('
@@ -110,6 +112,10 @@ discover_dataset_dirs <- function(root_path) {
   dirs <- list.dirs(root_path, recursive = FALSE, full.names = TRUE)
   dirs <- dirs[!startsWith(basename(dirs), ".")]
   dirs <- dirs[basename(dirs) != "cache"]
+  dirs <- dirs[basename(dirs) != "__MACOSX"]
+  dirs <- dirs[vapply(dirs, function(path) {
+    length(discover_flow_files(path)) > 0
+  }, logical(1))]
   sort(normalizePath(dirs, winslash = "/", mustWork = TRUE))
 }
 
@@ -179,6 +185,16 @@ dataset_tbl$dna_channels <- rep(list(default_dna_channels), nrow(dataset_tbl))
 dataset_tbl$dna_cofactor <- rep(default_dna_cofactor, nrow(dataset_tbl))
 dataset_tbl$dna_fraction_threshold <- rep(default_dna_fraction_threshold, nrow(dataset_tbl))
 dataset_tbl$raw_dna_reference_threshold <- rep(default_raw_dna_reference_threshold, nrow(dataset_tbl))
+
+ethanol_idx <- which(dataset_tbl$dataset_id == "polyploidization-ethanolfixation")
+if (length(ethanol_idx) > 0) {
+  dataset_tbl$qc_channels[ethanol_idx] <- list(c(
+    "FSC-A", "FSC-H", "FSC-W",
+    "SSC-A", "SSC-H", "SSC-W",
+    "450/50 Violet B-A", "450/50 Violet B-H", "450/50 Violet B-W"
+  ))
+  dataset_tbl$dna_channels[ethanol_idx] <- list(c("450/50 Violet B-A", "450/50 Violet B-H"))
+}
 
 dataset_tbl <- dataset_tbl %>%
   filter(enabled) %>%
@@ -488,7 +504,7 @@ build_or_load_dataset <- function(cfg) {
     built_gs
   }
 
-  sample_metadata <- parse_sample_metadata(cfg$flow_files)
+  sample_metadata <- parse_sample_metadata(cfg$flow_files, dataset_id = cfg$dataset_id)
   if (identical(cfg$dataset_id, "hypoxia-sum159") && nrow(hypoxia_passaging_day_tbl) > 0) {
     sample_metadata <- sample_metadata %>%
       left_join(hypoxia_passaging_day_tbl, by = "sample_name")
@@ -555,23 +571,102 @@ build_or_load_dataset <- function(cfg) {
   )
 }
 
-parse_sample_metadata <- function(sample_name) {
+parse_ethanol_sample_metadata <- function(sample_id) {
+  n <- length(sample_id)
+
+  metadata_tbl <- tibble(
+    sample_id = sample_id,
+    cell_line = rep(NA_character_, n),
+    condition = rep(NA_character_, n),
+    exposure_condition = rep(NA_character_, n),
+    passage_label = rep(NA_character_, n),
+    passage_number = rep(NA_integer_, n),
+    acquisition_id = rep(NA_integer_, n),
+    sample_role = rep(NA_character_, n)
+  )
+
+  metadata_tbl$acquisition_id <- suppressWarnings(as.integer(sub("^.*_([0-9]+)$", "\\1", sample_id)))
+
+  jurkat_idx <- grepl("^Jurkat_[0-9]+$", sample_id)
+  if (any(jurkat_idx)) {
+    metadata_tbl$cell_line[jurkat_idx] <- "Jurkat"
+    metadata_tbl$sample_role[jurkat_idx] <- "reference"
+  }
+
+  parental_idx <- grepl("^(.*?)(?:_|-)parental_[0-9]+$", sample_id, ignore.case = TRUE)
+  if (any(parental_idx)) {
+    metadata_tbl$cell_line[parental_idx] <- sub(
+      "^(.*?)(?:_|-)parental_[0-9]+$",
+      "\\1",
+      sample_id[parental_idx],
+      ignore.case = TRUE
+    )
+    metadata_tbl$condition[parental_idx] <- "parental"
+    metadata_tbl$exposure_condition[parental_idx] <- "parental"
+    metadata_tbl$sample_role[parental_idx] <- "control"
+  }
+
+  exposed_idx <- grepl("^[^_]+_[^_]+_A[0-9]+_[0-9]+$", sample_id)
+  if (any(exposed_idx)) {
+    exposed_parts <- strsplit(sample_id[exposed_idx], "_", fixed = TRUE)
+    metadata_tbl$cell_line[exposed_idx] <- vapply(exposed_parts, `[[`, character(1), 1)
+    metadata_tbl$exposure_condition[exposed_idx] <- vapply(exposed_parts, `[[`, character(1), 2)
+    metadata_tbl$passage_label[exposed_idx] <- vapply(exposed_parts, `[[`, character(1), 3)
+    metadata_tbl$passage_number[exposed_idx] <- suppressWarnings(as.integer(sub("^A", "", metadata_tbl$passage_label[exposed_idx])))
+    metadata_tbl$condition[exposed_idx] <- paste(
+      metadata_tbl$exposure_condition[exposed_idx],
+      metadata_tbl$passage_label[exposed_idx],
+      sep = "_"
+    )
+    metadata_tbl$sample_role[exposed_idx] <- "experiment"
+  }
+
+  metadata_tbl
+}
+
+parse_sample_metadata <- function(sample_name, dataset_id = NULL) {
   sample_id <- tools::file_path_sans_ext(basename(sample_name))
   cell_line <- rep(NA_character_, length(sample_id))
   condition <- rep(NA_character_, length(sample_id))
+  exposure_condition <- rep(NA_character_, length(sample_id))
+  passage_label <- rep(NA_character_, length(sample_id))
+  passage_number <- rep(NA_integer_, length(sample_id))
+  acquisition_id <- rep(NA_integer_, length(sample_id))
+  sample_role <- rep(NA_character_, length(sample_id))
 
   cell_line[sample_id == "Sample_CEN"] <- "CEN"
+  sample_role[sample_id == "Sample_CEN"] <- "reference"
 
   sum159_idx <- grepl("^Sample_SUM159_", sample_id)
   cell_line[sum159_idx] <- "SUM159"
-
   condition[sum159_idx] <- sub("^Sample_SUM159_([0-9]+_)?", "", sample_id[sum159_idx])
+  sample_role[sum159_idx] <- "experiment"
+
+  if (identical(dataset_id, "polyploidization-ethanolfixation")) {
+    ethanol_metadata <- parse_ethanol_sample_metadata(sample_id)
+    fill_idx <- !is.na(ethanol_metadata$cell_line) |
+      !is.na(ethanol_metadata$condition) |
+      !is.na(ethanol_metadata$sample_role)
+
+    cell_line[fill_idx] <- ethanol_metadata$cell_line[fill_idx]
+    condition[fill_idx] <- ethanol_metadata$condition[fill_idx]
+    exposure_condition[fill_idx] <- ethanol_metadata$exposure_condition[fill_idx]
+    passage_label[fill_idx] <- ethanol_metadata$passage_label[fill_idx]
+    passage_number[fill_idx] <- ethanol_metadata$passage_number[fill_idx]
+    acquisition_id[fill_idx] <- ethanol_metadata$acquisition_id[fill_idx]
+    sample_role[fill_idx] <- ethanol_metadata$sample_role[fill_idx]
+  }
 
   tibble(
     sample_name = basename(sample_name),
     sample_id = sample_id,
     cell_line = cell_line,
-    condition = condition
+    condition = condition,
+    exposure_condition = exposure_condition,
+    passage_label = passage_label,
+    passage_number = passage_number,
+    acquisition_id = acquisition_id,
+    sample_role = sample_role
   )
 }
 
@@ -584,7 +679,17 @@ add_sample_metadata <- function(tbl, metadata_tbl) {
   tbl %>%
     mutate(.sample_id = tools::file_path_sans_ext(basename(.data[[sample_col]]))) %>%
     left_join(
-      select(metadata_tbl, sample_id, cell_line, condition),
+      select(
+        metadata_tbl,
+        sample_id,
+        cell_line,
+        condition,
+        exposure_condition,
+        passage_label,
+        passage_number,
+        acquisition_id,
+        sample_role
+      ),
       by = c(".sample_id" = "sample_id")
     ) %>%
     select(-.sample_id)
@@ -1164,10 +1269,25 @@ raw_dna_plot_palette <- function(group_values) {
 
 build_raw_dna_plot_df <- function(filtered_dna_area, sample_metadata, max_signal = Inf) {
   sample_tbl <- tibble(sample_id = names(filtered_dna_area$raw)) %>%
-    left_join(select(sample_metadata, sample_id, cell_line, condition), by = "sample_id") %>%
+    left_join(
+      select(
+        sample_metadata,
+        sample_id,
+        cell_line,
+        condition,
+        exposure_condition,
+        passage_label,
+        passage_number,
+        acquisition_id,
+        sample_role
+      ),
+      by = "sample_id"
+    ) %>%
     mutate(
-      condition_plot = ifelse(is.na(condition), "Unannotated", condition),
-      is_control = condition_plot %in% c("2N_Control", "4N_Control") | sample_id == "Sample_CEN",
+      condition_plot = dplyr::coalesce(condition, exposure_condition, "Unannotated"),
+      is_control = sample_role %in% c("control", "reference") |
+        condition_plot %in% c("2N_Control", "4N_Control") |
+        sample_id == "Sample_CEN",
       overlay_group = ifelse(is_control, "Controls", condition_plot),
       sample_label = sample_id
     )
