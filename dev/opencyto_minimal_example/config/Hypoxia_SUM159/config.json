@@ -1,0 +1,56 @@
+{
+  "dataset": "Hypoxia_SUM159",
+  "fcs_dir": "data/Hypoxia_SUM159",
+  "fcs_pattern": "\\.fcs$",
+  "template_path": "minimal-gating-template.csv",
+  "channel_map_path": "channel-map.csv",
+  "dna_channel": "DNA_AREA_ASINH",
+  "random_seed": 1,
+  "allowed_transforms": ["ASINH"],
+  "transforms": {
+    "ASINH": {
+      "cofactor": 150
+    }
+  },
+  "preprocessing": {
+    "method": "PeacoQC",
+    "enabled": true,
+    "channels": ["FSC-A", "SSC-A", "DNA_AREA", "DNA_HEIGHT"],
+    "determine_good_cells": "all",
+    "plot": false,
+    "save_fcs": false,
+    "report": false
+  },
+  "outputs": {
+    "gated_dir": "dev/opencyto_minimal_example/output/Hypoxia_SUM159/gated_flow",
+    "debug_dir": "dev/opencyto_minimal_example/output/Hypoxia_SUM159/debug"
+  },
+  "plots": {
+    "output_dir": "dev/opencyto_minimal_example/output/Hypoxia_SUM159/figures",
+    "summary_file": "summary.png",
+    "cleanup_panels": true,
+    "layout": {
+      "design": [
+        "GGDD",
+        "TTCC",
+        "FFUU",
+        "SSAA",
+        "BBBB"
+      ],
+      "width": 14,
+      "height": 15,
+      "dpi": 150
+    },
+    "panels": [
+      {"id": "template_graph", "slot": "G", "type": "gating_template_graph", "title": "Gating template"},
+      {"id": "final_dna", "slot": "D", "type": "population_density", "population": "cells_keep", "x": "DNA_AREA_ASINH", "title": "Final DNA-A"},
+      {"id": "tumor", "slot": "T", "type": "gate_step", "population": "tumor"},
+      {"id": "cen", "slot": "C", "type": "gate_step", "population": "cen"},
+      {"id": "tumor_fsc_singlets", "slot": "F", "type": "gate_step", "population": "tumor_fsc_singlets", "title": "Tumor FSC-A vs FSC-H"},
+      {"id": "tumor_singlets", "slot": "S", "type": "gate_step", "population": "tumor_singlets"},
+      {"id": "cen_singlets", "slot": "U", "type": "gate_step", "population": "cen_singlets"},
+      {"id": "tumor_dna_support", "slot": "A", "type": "gate_step", "population": "tumor_dna_support"},
+      {"id": "cen_dna_support", "slot": "B", "type": "gate_step", "population": "cen_dna_support"}
+    ]
+  }
+}

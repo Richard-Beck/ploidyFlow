@@ -11,3 +11,6 @@ tmp/
 dev/hypoxia_peak_reduced/output/**/nuts/
 dev/hypoxia_peak_reduced/output/extensions_test/
 dev/hypoxia_peak_reduced/output/**/*_opt-*.csv
+dev/opencyto_minimal_example/output/
+dev/opencyto_minimal_example/plots/
+dev/opencyto_minimal_example/PeacoQC_results/

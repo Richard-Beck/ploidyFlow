@@ -15,6 +15,7 @@ This repository now has two main analysis entry points:
 
 - `results/2026-04-13-fixed-init-anoxia/`: preserved anoxia-only checkpoint
 - `dev/hypoxia_peak_reduced/`: active hypoxia development checkpoint
+- `dev/opencyto_minimal_example/`: active OpenCyto preprocessing prototype
 
 The preserved anoxia archive contains the three model variants currently worth
 comparing:
@@ -61,6 +62,18 @@ question. The current working interpretation there is:
 That hypoxia interpretation is still provisional and remains under `dev/`
 rather than being promoted into a preserved `results/` checkpoint.
 
+## Preprocessing Direction
+
+The active preprocessing prototype is now `dev/opencyto_minimal_example/`. It
+implements dataset-configured OpenCyto gating, debug/QC summaries, agreed DNA-A
+tumor peak detection, and peak inspection plots.
+
+This workflow is intended to become the canonical preprocessing path for the
+repository. The older preprocessing logic in `workflow/data_prep.Rmd` should be
+treated as legacy and eventually deprecated. Downstream analyses that currently
+consume Rmd-derived outputs will need to be migrated to the OpenCyto outputs
+once that interface is finalized.
+
 ## Experimental Caveats
 
 The 2N and 4N controls remain unresolved outliers in both the anoxia and
@@ -77,8 +90,10 @@ not yet represented.
 
 ## Main Entry Points
 
-- `workflow/data_prep.Rmd`: gating, export, and exploratory data-preparation
-  workflow
+- `dev/opencyto_minimal_example/README.md`: active OpenCyto preprocessing
+  prototype and migration notes
+- `workflow/data_prep.Rmd`: legacy gating, export, and exploratory
+  data-preparation workflow
 - `workflow/fixed_init_anoxia_checkpoint.Rmd`: archived three-model comparison
   for the anoxia checkpoint
 - `dev/hypoxia_peak_reduced/README.md`: current hypoxia checkpoint notes and

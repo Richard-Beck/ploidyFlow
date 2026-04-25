@@ -1,0 +1,14 @@
+raw_channel,standard_channel
+FSC-A,FSC-A
+FSC-H,FSC-H
+FSC-W,FSC-W
+SSC-A,SSC-A
+SSC-H,SSC-H
+SSC-W,SSC-W
+530-Blue D-A,BLUE-D-A
+530-Blue D-H,BLUE-D-H
+670-Red C-A,RED_AREA
+670-Red C-H,RED_HEIGHT
+450-Violet C-A,DNA_AREA
+450-Violet C-H,DNA_HEIGHT
+Time,Time

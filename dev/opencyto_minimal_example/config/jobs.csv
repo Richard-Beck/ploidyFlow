@@ -1,0 +1,4 @@
+dataset,config_dir
+Anoxia_FlowCytometry,dev/opencyto_minimal_example/config/Anoxia_FlowCytometry
+Hypoxia_SUM159,dev/opencyto_minimal_example/config/Hypoxia_SUM159
+Polyploidization_EthanolFixation,dev/opencyto_minimal_example/config/Polyploidization_EthanolFixation
