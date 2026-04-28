@@ -20,6 +20,7 @@ Until that migration is complete, this folder should be treated as the candidate
 - `dev_tumor_singlet_gate_lab.R`: development script used to inspect and tune tumor singlet gating.
 - `dev_peak_detection_lab.R`: agreed DNA-A peak detection workflow.
 - `plot_agreed_tumor_peaks_by_sample.R`: inspection plots for agreed tumor peak positions and adjacent peak ratios, with QC-flagged samples highlighted.
+- `plot_filtered_tumor_singlet_raw_signal.R`: optional per-sample raw `DNA-A` versus `DNA-H` plots for the filtered tumor singlet population.
 
 Generated folders are intentionally not tracked:
 
@@ -37,18 +38,28 @@ Run from the repository root:
 Rscript dev/opencyto_minimal_example/run_minimal_opencyto_jobs.R .
 Rscript dev/opencyto_minimal_example/dev_peak_detection_lab.R .
 Rscript dev/opencyto_minimal_example/plot_agreed_tumor_peaks_by_sample.R .
+Rscript dev/opencyto_minimal_example/plot_filtered_tumor_singlet_raw_signal.R .
 ```
 
 The first command gates the configured datasets and writes gated flow sets, debug tables, and configured gating figures under `output/`.
 
-The second command performs the current agreed peak detection and writes peak call tables plus per-sample diagnostic figures under `output/peak_detection_figures/`.
+The second command performs the current agreed peak detection and writes peak call tables plus per-sample diagnostic figures under `output/peak_detection_figures/`. Peak detection is run separately on `cen_dna_support` and `tumor_dna_support`, with lower CEN sensitivity thresholds so smaller CEN doublet peaks can be detected without relaxing tumor peak detection.
 
 The third command writes the current high-level inspection plots under `output/peak_consistency/`:
 
 - `agreed_tumor_peaks_by_sample.png`
 - `tumor_peak_ratio_by_sample.png`
+- `tumor_2_1_peak_ratio_by_dataset.png`
+- `lower_peak_location_vs_adjacent_ratio.png`
+- `agreed_tumor_peak_fwhm_cv.csv`
+- `agreed_tumor_peak_fwhm_cv_by_sample.png`
+- `cen_peak_ratio_by_dataset.png`
+- `cen_largest_peak_fwhm_cv.csv`
+- `cen_largest_peak_fwhm_cv_by_dataset.png`
 
 It also writes `output/peak_detection_figures/agreed_tumor_peaks_by_sample.csv`, which includes inferred cell line labels, ordered agreed tumor peak labels, and QC flags used by the plots.
+
+The fourth command writes optional per-sample raw `DNA-A` versus `DNA-H` plots for the filtered tumor singlet population under `output/peak_consistency/filtered_tumor_singlet_raw_signal/`.
 
 ## Dataset notes
 
@@ -58,7 +69,7 @@ Current cell-line inference rules used by `plot_agreed_tumor_peaks_by_sample.R` 
 - `Hypoxia_SUM159`: filenames containing `_2N_` are treated as `SUM159_2N`; filenames containing `_4N_` are treated as `SUM159_4N`.
 - `Polyploidization_EthanolFixation`: the first filename token before `_` is used as the cell-line identifier, except `DKMG` samples are mapped to `SUM159_2N`.
 
-Agreed tumor peaks are ordered within each sample by raw DNA-A and labelled `Tumor 1`, `Tumor 2`, and `Tumor 3` for plotting. These labels are ordered peak identifiers only; they should not be interpreted or renamed as biological `2N`, `4N`, or `8N` states without additional validation.
+Agreed peaks include a `branch` column. CEN peaks are ordered within each sample by raw DNA-A and labelled `CEN 1` and `CEN 2`; tumor peaks are ordered within each sample by raw DNA-A and labelled `Tumor 1`, `Tumor 2`, and `Tumor 3` for plotting. These labels are ordered peak identifiers only; they should not be interpreted or renamed as biological `2N`, `4N`, or `8N` states without additional validation.
 
 ## QC flags
 

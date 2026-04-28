@@ -48,7 +48,7 @@
       {"id": "cen", "slot": "C", "type": "gate_step", "population": "cen"},
       {"id": "tumor_fsc_singlets", "slot": "F", "type": "gate_step", "population": "tumor_fsc_singlets", "title": "Tumor FSC-A vs FSC-H"},
       {"id": "tumor_singlets", "slot": "S", "type": "gate_step", "population": "tumor_singlets"},
-      {"id": "cen_singlets", "slot": "U", "type": "gate_step", "population": "cen_singlets"},
+      {"id": "cen_dna", "slot": "U", "type": "population_density", "population": "cen", "x": "DNA_AREA_ASINH", "title": "CEN DNA-A"},
       {"id": "tumor_dna_support", "slot": "A", "type": "gate_step", "population": "tumor_dna_support"},
       {"id": "cen_dna_support", "slot": "B", "type": "gate_step", "population": "cen_dna_support"}
     ]

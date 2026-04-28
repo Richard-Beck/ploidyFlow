@@ -1,0 +1,289 @@
+---
+title: "Flow Cytometry DNA-Content QC Across Fixation Workflows"
+knit: !expr function(input_file, encoding) rmarkdown::render(input_file, encoding = encoding, output_dir = dirname(input_file), intermediates_dir = dirname(input_file), envir = new.env(parent = globalenv()))
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r setup, include=FALSE}
+input_path <- knitr::current_input(dir = TRUE)
+report_dir <- if (length(input_path) == 0 || !nzchar(input_path)) {
+  getwd()
+} else {
+  dirname(input_path)
+}
+
+find_project_root <- function(start_dir) {
+  current_dir <- normalizePath(start_dir, winslash = "/", mustWork = TRUE)
+  repeat {
+    if (
+      dir.exists(file.path(current_dir, ".git")) &&
+        dir.exists(file.path(current_dir, "dev", "opencyto_minimal_example"))
+    ) {
+      return(current_dir)
+    }
+    parent_dir <- dirname(current_dir)
+    if (identical(parent_dir, current_dir)) {
+      stop("Could not find project root from ", start_dir, call. = FALSE)
+    }
+    current_dir <- parent_dir
+  }
+}
+
+resolved_report_dir <- normalizePath(report_dir, winslash = "/", mustWork = TRUE)
+if (
+  identical(basename(resolved_report_dir), "opencyto_minimal_example") &&
+    identical(basename(dirname(resolved_report_dir)), "dev")
+) {
+  example_dir <- resolved_report_dir
+  project_root <- normalizePath(file.path(example_dir, "..", ".."), winslash = "/", mustWork = TRUE)
+} else {
+  project_root <- find_project_root(resolved_report_dir)
+  example_dir <- normalizePath(file.path(project_root, "dev", "opencyto_minimal_example"), winslash = "/", mustWork = TRUE)
+}
+out_dir <- normalizePath(file.path(example_dir, "output"), winslash = "/", mustWork = TRUE)
+
+knitr::opts_knit$set(root.dir = project_root)
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  out.width = "100%"
+)
+
+figure_path <- function(...) {
+  normalizePath(file.path(out_dir, ...), winslash = "/", mustWork = FALSE)
+}
+
+include_required_figure <- function(path) {
+  if (!file.exists(path)) {
+    stop(
+      "Missing report figure: ", path,
+      "\nRegenerate the OpenCyto workflow outputs, then rerender this report.",
+      call. = FALSE
+    )
+  }
+  knitr::include_graphics(path, rel_path = FALSE)
+}
+
+image_panel <- function(items) {
+  missing_files <- vapply(items, function(item) !file.exists(item$path), logical(1))
+  if (any(missing_files)) {
+    stop(
+      "Missing report figure(s):\n",
+      paste(vapply(items[missing_files], `[[`, character(1), "path"), collapse = "\n"),
+      call. = FALSE
+    )
+  }
+
+  blocks <- vapply(items, function(item) {
+    sprintf(
+      '<div class="image-panel-item"><div class="image-panel-title">%s</div><img src="%s" /></div>',
+      item$title,
+      knitr::image_uri(item$path)
+    )
+  }, character(1))
+
+  knitr::asis_output(paste0(
+    '<div class="image-panel">',
+    paste(blocks, collapse = "\n"),
+    '</div>'
+  ))
+}
+```
+
+```{css, echo=FALSE}
+.image-panel {
+  display: flex;
+  gap: 18px;
+  align-items: flex-start;
+  margin: 1.2rem 0 1.8rem;
+}
+.image-panel-item {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.image-panel-title {
+  font-size: 1.15rem;
+  font-weight: 700;
+  line-height: 1.25;
+  margin-bottom: 0.45rem;
+}
+.image-panel img {
+  width: 100%;
+  height: auto;
+}
+@media (max-width: 900px) {
+  .image-panel {
+    flex-direction: column;
+  }
+}
+```
+
+# Executive Summary
+
+The ethanol-fixed dataset appears worse than the formaldehyde-fixed datasets on multiple QC metrics, consistent with Vural's advice that this workflow is less forgiving.
+
+Accurate DNA content determination depends on linearity between DNA content and fluorescence intensity.
+All three datasets fall short on at least part of this criterion. **Linearity is important because DNA-content estimates are inferred from relative peak positions. If fluorescence intensity does not scale proportionally with DNA amount, then a 4N or 8N population may not appear at twice or four times the 2N peak, making inferred ploidy states and between-sample DNA-content shifts unreliable.**
+Controls spanning the expected DNA-content range, together with focused protocol development, should help diagnose and improve these limitations.
+
+Dataset comparisons are difficult because the controls and protocols differ.
+In particular, data from assays that may induce substantial chromosomal instability are not ideal for protocol development.
+These datasets can reveal problems, but they are not well structured for deciding which protocol modification fixes them.
+
+# Preamble
+
+A standardized PeacoQC to OpenCyto gating workflow is applied with per-experiment tuned configs.
+OpenCyto has a major advantage over bespoke manual gating: it is consistent and transparent.
+The CEN gating branch intentionally does not include doublet discrimination, because CEN doublets are used later as a QC signal.
+Specifically, the CEN singlet/doublet ratio is used as an internal linearity check.
+
+I tuned the gating so that the output plots generally agreed with Vural's manual gating.
+The notable exception is the anoxia A1 group.
+My current interpretation is that these data do not support bona fide WGD in those samples; the apparent accumulation of "6N" events is more consistent with triplets, which can masquerade as high-DNA events if aggregates are not fully removed.
+This interpretation should be checked against the gating summaries below.
+
+```{r gating-summary-panel, results='asis'}
+image_panel(list(
+  list(
+    title = "Anoxia: Sample_SUM159_10_A1.fcs",
+    path = figure_path("Anoxia_FlowCytometry", "figures", "Sample_SUM159_10_A1.fcs_summary.png")
+  )
+))
+```
+
+The gating summary shows the main steps of the standardized workflow.
+Events are first filtered by PeacoQC to remove unstable acquisition intervals.
+The remaining events are gated to exclude margin events and obvious debris, then split into CEN and tumor-supporting populations.
+The tumor branch includes singlet gating before DNA-A peak analysis; the CEN branch intentionally retains singlets and doublets so the doublet/singlet ratio can be used as an internal linearity check.
+
+Peak detection was then applied to the gated DNA-A distributions.
+Two methods were used, and the agreed peak calls were taken forward for further analysis.
+The example below is included as a sanity check: this sample has an expected peak structure from karyotyping, and the detected CEN and tumor peaks are consistent with that expectation.
+I inspected the remaining peak-detection plots, and the calls were generally reasonable.
+
+```{r hypoxia-cen-peak-detector}
+include_required_figure(figure_path(
+  "peak_detection_figures",
+  "Hypoxia_SUM159__Sample_SUM159_2N_O2_A18.fcs__CEN.png"
+))
+```
+
+```{r hypoxia-tumor-peak-detector}
+include_required_figure(figure_path(
+  "peak_detection_figures",
+  "Hypoxia_SUM159__Sample_SUM159_2N_O2_A18.fcs__Tumor.png"
+))
+```
+
+# QC Main Diagnostic Results
+
+The processed outputs support a useful set of QC metrics.
+I would use these, or a similar set, in future flow experiments to evaluate whether the data are suitable for precise DNA content analysis.
+
+## CEN Peaks
+
+CEN peaks provide two useful diagnostics.
+
+The first is peak width.
+Throughout this report, CV is approximated from full width at half maximum (FWHM).
+For CEN cells, the anoxia experiment approaches the commonly cited target range: the BD DNA QC Particles technical sheet expects CEN singlet CV <=3%, and Koutecky et al. note that fixed cells such as chicken or trout red blood cells can be used as bead alternatives, with CVs <3% expected in well-tuned instruments (https://doi.org/10.1002/cyto.a.24798; BD Biosciences DNA QC Particles, material 349523).
+
+```{r cen-largest-peak-fwhm-cv}
+include_required_figure(figure_path(
+  "peak_consistency",
+  "cen_largest_peak_fwhm_cv_by_dataset.png"
+))
+```
+
+The second is linearity.
+Accurate DNA content determination requires a linear relationship between DNA content and fluorescence intensity.
+CEN cells are useful here because they tend to form doublets, creating a built-in 2x reference.
+A CEN doublet should have approximately twice the fluorescence of a CEN singlet.
+For DNA peaks expected to be separated by a factor of two, such as G0/G1 versus G2/M or singlet/doublet peaks, published guidance commonly uses ratios close to 2 as a practical linearity check.
+Darzynkiewicz et al. state that the G2/G1 ratio is expected to be 1.95-2.0 for DNA-content linearity, and the BD DNA QC Particles technical sheet gives an acceptable CEN doublet/singlet linearity range of 1.95-2.05 (https://doi.org/10.1002/cpim.36; BD Biosciences DNA QC Particles, material 349523).
+The anoxia dataset falls mostly within this range, as do a handful of hypoxia samples.
+Some hypoxia samples fall so far outside this range that they likely reflect another problem rather than nonlinearity alone, such as peak misidentification, gating failure, acquisition instability, or sample-specific artifacts.
+
+```{r cen-peak-ratio}
+include_required_figure(figure_path(
+  "peak_consistency",
+  "cen_peak_ratio_by_dataset.png"
+))
+```
+
+## Tumor Peaks
+
+The same logic can be applied to tumor cells, with more caution.
+
+The tumor 1 CV proxy is derived from the first detected tumor peak.
+In most samples this is the G0/G1 peak for the lowest-ploidy population and is usually the largest tumor peak.
+Because these populations are aneuploid, the absolute values are hard to interpret.
+Comparisons for the same cell lines across experiments should be more informative.
+That breaks down when the assay condition itself is expected to induce chromosomal instability, as may be true for all conditions here.
+Aneuploidy and possible CIN mean peak broadening can reflect real biological heterogeneity, so tumor-cell CV is useful as a workflow-output metric but not a clean protocol-performance metric.
+Within the current data, the fairest comparison is among SUM159 unstressed/control samples across the three experiments, since these are the closest available within-cell-line controls.
+For future methods development, the cleanest CV comparator would be karyotypically homogeneous reference material with known DNA content, processed through the same fixation and staining workflow.
+
+```{r tumor-1-cv-proxy}
+include_required_figure(figure_path(
+  "peak_consistency",
+  "tumor_1_peak_fwhm_cv_by_dataset.png"
+))
+```
+
+The tumor G2/M:G0/G1 ratio is a second linearity check. None of these are in the acceptable range.
+Given that CEN linearity is more reasonable in at least some samples, my hypothesis is that detector gain is set too high.
+If gain is too high, higher-DNA tumor peaks may be pushed into a less linear or partially saturated part of the detector response, while lower CEN singlet/doublet behavior can still look acceptable.
+Koutecky et al. note that "the recommended range is less than 3- or 4-fold" for the fluorescence interval over which linear response is assured by the manufacturer (https://doi.org/10.1002/cyto.a.24798).
+This matters because the CEN peak is roughly 30% of the 2N tumor peak.
+The CEN-to-2N interval is therefore already about three-fold; CEN-to-4N is about six-fold; and CEN-to-8N is about twelve-fold.
+The deviation from linearity becomes more pronounced for higher-ploidy cell lines, which is consistent with the measurement range exceeding the linear response interval.
+
+```{r tumor-g2-g1-ratio}
+include_required_figure(figure_path(
+  "peak_consistency",
+  "tumor_2_1_peak_ratio_by_dataset.png"
+))
+```
+
+## Excluded Cells
+
+The final diagnostic is the percent of excluded cells at each pipeline stage.
+High removal fractions are not necessarily dealbreakers.
+Margin removal captures events at the lower or upper detector limits.
+In this setting, DNA-A margin events are especially concerning because they can mean DNA-content signal is clipped or outside the useful measurement range; FSC/SSC margin events may also indicate debris, aggregates, or inappropriate acquisition settings.
+PeacoQC removals indicate time-dependent acquisition instability, which can reflect fluidics issues such as clogs, bubbles, or unstable flow.
+Gating removals indicate doublets, aggregates, or debris, but they can also reflect overly aggressive gates, especially if final retained fractions vary substantially across samples.
+The ethanol-fixed data show high levels of removal, again consistent with this protocol being less forgiving.
+High or highly variable removal also means the retained events may represent a selected subpopulation, making sample-to-sample DNA-content comparisons less secure.
+
+```{r qc-removed-by-dataset}
+include_required_figure(figure_path(
+  "peak_consistency",
+  "qc_removed_by_dataset.png"
+))
+```
+
+# Discussion and next steps
+
+This report deliberately focuses on a small set of figures that most directly summarize batch quality, rather than attempting to document every possible acquisition- or gating-level QC feature.
+Interpreted together, these summaries suggest that the current experiments are useful for identifying the main limitations of the existing data, but they should not be treated as the output of a protocol designed and optimized for accurate DNA-content measurement.
+They are also not an ideal basis for systematic protocol development, since key experimental factors were not varied in a controlled way.
+
+The immediate next step should therefore be focused methods development, using an agreed set of quantitative metrics, such as those in this report, to judge whether each protocol change improves or worsens performance.
+Within that framework, the two dominant issues to prioritize are peak CV and DNA-content linearity.
+FWHM-approximated CV provides a practical summary of whether fixation, staining, acquisition, and singlet gating are producing sufficiently sharp DNA-content peaks for downstream analysis.
+For tumor cells, however, CV is not a clean protocol metric when the biology itself may broaden peaks.
+Linearity should be tested explicitly with controls spanning the intended measurement range, so that 2N, 4N, and 8N populations are all on scale, meaning not clipped at detector limits or compressed near the top of the detector range, well separated, and close to their expected relative positions.
+
+Finally, Jurkat cells should not be treated as known DNA-content standards unless the specific local stock has first been independently characterized.
+This is particularly relevant given the suggestion to use Jurkat cells as controls.
+
+Wilson et al. recently reported substantial karyotypic heterogeneity in Jurkat E6-1 cells both within and between laboratory stocks, supporting the view that they are better treated as unknown biological material unless locally validated (https://doi.org/10.1038/s41598-025-95903-0).

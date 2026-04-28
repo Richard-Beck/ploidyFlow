@@ -137,39 +137,30 @@ select_ratio_separated_peaks <- function(candidates, n_keep = 3L, min_ratio = 1.
   candidates[keep_idx, , drop = FALSE][order(candidates$peak_x[keep_idx]), , drop = FALSE]
 }
 
-detect_gate_split_peaks <- function(gh, gs) {
-  cen_pop <- optional_population(gs, "cen_dna_support")
-  tumor_pop <- optional_population(gs, "tumor_dna_support")
-  peak_parts <- list()
-
-  if (!is.null(cen_pop)) {
-    cen_candidates <- find_density_peak_candidates(raw_dna_values(gh, cen_pop))
-    if (nrow(cen_candidates)) {
-      cen_peak <- cen_candidates[1L, , drop = FALSE]
-      cen_peak$method <- "1. gate split KDE"
-      cen_peak$peak_type <- "CEN"
-      peak_parts[[length(peak_parts) + 1L]] <- cen_peak
-    }
+detect_gate_split_peaks <- function(values, branch) {
+  if (branch == "CEN") {
+    candidates <- find_density_peak_candidates(values, min_relative_height = 0.003)
+    peaks <- select_ratio_separated_peaks(candidates, n_keep = 2L, min_ratio = 1.35)
+  } else {
+    candidates <- find_density_peak_candidates(values, min_relative_height = 0.01)
+    peaks <- select_ratio_separated_peaks(candidates, n_keep = 3L, min_ratio = 1.5)
   }
 
-  if (!is.null(tumor_pop)) {
-    tumor_candidates <- find_density_peak_candidates(raw_dna_values(gh, tumor_pop))
-    tumor_peaks <- select_ratio_separated_peaks(tumor_candidates, n_keep = 3L, min_ratio = 1.5)
-    if (nrow(tumor_peaks)) {
-      tumor_peaks$method <- "1. gate split KDE"
-      tumor_peaks$peak_type <- paste0("Tumor ", seq_len(nrow(tumor_peaks)))
-      peak_parts[[length(peak_parts) + 1L]] <- tumor_peaks
-    }
-  }
-
-  if (!length(peak_parts)) {
+  if (!nrow(peaks)) {
     return(data.frame())
   }
 
-  do.call(rbind, peak_parts)
+  peaks$method <- "1. gate split KDE"
+  peaks$peak_type <- paste0(branch, " ", seq_len(nrow(peaks)))
+  peaks
 }
 
-detect_stability_peaks <- function(values) {
+detect_stability_peaks <- function(
+  values,
+  min_relative_height = 0.01,
+  min_relative_prominence = 0.008,
+  min_bandwidth_support = 4L
+) {
   result <- tryCatch(
     detect_kde_stable_peaks(
       values = values,
@@ -177,10 +168,10 @@ detect_stability_peaks <- function(values) {
       bandwidth_method = "SJ",
       transform = "log10",
       density_n = 2048L,
-      min_relative_height = 0.01,
-      min_relative_prominence = 0.008,
+      min_relative_height = min_relative_height,
+      min_relative_prominence = min_relative_prominence,
       cluster_tolerance = 0.035,
-      min_bandwidth_support = 4L,
+      min_bandwidth_support = min_bandwidth_support,
       min_n = 50L
     ),
     error = function(e) NULL
@@ -317,7 +308,7 @@ plot_method_comparison <- function(plot_values, peak_tbl, agreed_tbl, dataset, s
     scale_y_continuous(expand = ggplot2::expansion(mult = c(0.02, 0.20))) +
     labs(
       title = paste(dataset, sample_name, sep = " / "),
-      subtitle = paste0("cells_keep raw DNA_AREA | n = ", length(plot_values)),
+      subtitle = paste0("raw DNA_AREA | n = ", length(plot_values)),
       x = "Raw DNA-A",
       y = "Event count"
     ) +
@@ -375,6 +366,16 @@ plot_method_comparison <- function(plot_values, peak_tbl, agreed_tbl, dataset, s
   ggplot2::ggsave(output_file, p, width = 12, height = 8, dpi = 150, bg = "white")
 }
 
+branch_specs <- data.frame(
+  branch = c("CEN", "Tumor"),
+  population = c("cen_dna_support", "tumor_dna_support"),
+  min_relative_height = c(0.003, 0.01),
+  min_relative_prominence = c(0.003, 0.008),
+  min_bandwidth_support = c(3L, 4L),
+  max_log10_distance = c(0.10, 0.08),
+  stringsAsFactors = FALSE
+)
+
 dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
 unlink(list.files(figure_dir, pattern = "\\.png$", full.names = TRUE), force = TRUE)
 peak_call_file <- file.path(figure_dir, "peak_calls_by_method.csv")
@@ -398,44 +399,85 @@ for (gated_dir in gated_dirs) {
     gh <- gs[[sample_name]]
     keep_values <- raw_dna_values(gh, keep_pop)
 
-    gate_split_peaks <- detect_gate_split_peaks(gh, gs)
-    stability_peaks <- detect_stability_peaks(keep_values)
-    peak_tbl <- rbind(gate_split_peaks, stability_peaks)
-    agreed_tbl <- build_agreed_peak_set(keep_values, peak_tbl)
+    for (branch_i in seq_len(nrow(branch_specs))) {
+      spec <- branch_specs[branch_i, , drop = FALSE]
+      branch_pop <- optional_population(gs, spec$population[[1L]])
+      if (is.null(branch_pop)) {
+        next
+      }
 
-    if (nrow(peak_tbl)) {
-      peak_tbl$dataset <- dataset
-      peak_tbl$sample_name <- sample_name
-      peak_tbl$n_events_cells_keep <- length(keep_values)
-      all_peak_calls[[length(all_peak_calls) + 1L]] <- peak_tbl[
-        ,
-        c("dataset", "sample_name", "n_events_cells_keep", setdiff(names(peak_tbl), c("dataset", "sample_name", "n_events_cells_keep"))),
-        drop = FALSE
-      ]
-    }
-    if (nrow(agreed_tbl)) {
-      agreed_tbl$dataset <- dataset
-      agreed_tbl$sample_name <- sample_name
-      agreed_tbl$n_events_cells_keep <- length(keep_values)
-      all_agreed_peaks[[length(all_agreed_peaks) + 1L]] <- agreed_tbl[
-        ,
-        c("dataset", "sample_name", "n_events_cells_keep", setdiff(names(agreed_tbl), c("dataset", "sample_name", "n_events_cells_keep"))),
-        drop = FALSE
-      ]
-    }
-
-    output_file <- file.path(
-      figure_dir,
-      paste0(
-        sanitize_filename(dataset),
-        "__",
-        sanitize_filename(sample_name),
-        ".png"
+      branch_values <- raw_dna_values(gh, branch_pop)
+      gate_split_peaks <- detect_gate_split_peaks(branch_values, spec$branch[[1L]])
+      stability_peaks <- detect_stability_peaks(
+        branch_values,
+        min_relative_height = spec$min_relative_height[[1L]],
+        min_relative_prominence = spec$min_relative_prominence[[1L]],
+        min_bandwidth_support = spec$min_bandwidth_support[[1L]]
       )
-    )
+      peak_tbl <- rbind(gate_split_peaks, stability_peaks)
+      agreed_tbl <- build_agreed_peak_set(branch_values, peak_tbl, max_log10_distance = spec$max_log10_distance[[1L]])
 
-    plot_method_comparison(keep_values, peak_tbl, agreed_tbl, dataset, sample_name, output_file)
-    plot_count <- plot_count + 1L
+      if (nrow(peak_tbl)) {
+        peak_tbl$dataset <- dataset
+        peak_tbl$sample_name <- sample_name
+        peak_tbl$branch <- spec$branch[[1L]]
+        peak_tbl$n_events_cells_keep <- length(keep_values)
+        peak_tbl$n_events_branch <- length(branch_values)
+        all_peak_calls[[length(all_peak_calls) + 1L]] <- peak_tbl[
+          ,
+          c(
+            "dataset",
+            "sample_name",
+            "branch",
+            "n_events_cells_keep",
+            "n_events_branch",
+            setdiff(names(peak_tbl), c("dataset", "sample_name", "branch", "n_events_cells_keep", "n_events_branch"))
+          ),
+          drop = FALSE
+        ]
+      }
+      if (nrow(agreed_tbl)) {
+        agreed_tbl$dataset <- dataset
+        agreed_tbl$sample_name <- sample_name
+        agreed_tbl$branch <- spec$branch[[1L]]
+        agreed_tbl$n_events_cells_keep <- length(keep_values)
+        agreed_tbl$n_events_branch <- length(branch_values)
+        all_agreed_peaks[[length(all_agreed_peaks) + 1L]] <- agreed_tbl[
+          ,
+          c(
+            "dataset",
+            "sample_name",
+            "branch",
+            "n_events_cells_keep",
+            "n_events_branch",
+            setdiff(names(agreed_tbl), c("dataset", "sample_name", "branch", "n_events_cells_keep", "n_events_branch"))
+          ),
+          drop = FALSE
+        ]
+      }
+
+      output_file <- file.path(
+        figure_dir,
+        paste0(
+          sanitize_filename(dataset),
+          "__",
+          sanitize_filename(sample_name),
+          "__",
+          sanitize_filename(spec$branch[[1L]]),
+          ".png"
+        )
+      )
+
+      plot_method_comparison(
+        branch_values,
+        peak_tbl,
+        agreed_tbl,
+        dataset,
+        paste(sample_name, spec$branch[[1L]], sep = " / "),
+        output_file
+      )
+      plot_count <- plot_count + 1L
+    }
   }
 }
 

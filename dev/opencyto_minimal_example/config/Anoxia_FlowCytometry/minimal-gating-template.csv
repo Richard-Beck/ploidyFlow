@@ -1,10 +1,9 @@
 alias,pop,parent,dims,gating_method,gating_args,collapseDataForGating,groupBy,preprocessing_method,preprocessing_args,comments
 PeacoQC_Clean,+,root,FSC-A_ASINH,boundary,"min = c(-Inf), max = c(Inf)",,,,,Preprocessed event set after PeacoQC
 tumor,+,PeacoQC_Clean,"FSC-A_ASINH,DNA_HEIGHT_ASINH",boundary,"min = c(5.6, 5.3), max = c(8.2, 8.2)",,,,,Initial region containing tumor cells
-cen,+,PeacoQC_Clean,"FSC-A_ASINH,DNA_HEIGHT_ASINH",boundary,"min = c(3.3, 3.7), max = c(4.7, 6)",,,,,Initial region containing CEN
+cen,+,PeacoQC_Clean,"FSC-A_ASINH,DNA_HEIGHT_ASINH",boundary,"min = c(3.3, 3.7), max = c(5.2, 6)",,,,,Initial region containing CEN
 tumor_fsc_singlets,+,tumor,"FSC-A,FSC-H",flowClust.2d,"K = 2, quantile = 0.95",,,,,Prominent tumor FSC-A/FSC-H cluster before DNA singlet gating
 tumor_singlets,+,tumor_fsc_singlets,"DNA_AREA_ASINH,DNA_HEIGHT_ASINH",singletGate,"prediction_level = 0.95, wider_gate = TRUE, subsample_pct = 0.3",,,,,Adaptive DNA singlet gate within the tumor branch
-cen_singlets,+,cen,"DNA_AREA_ASINH,DNA_HEIGHT_ASINH",singletGate,"prediction_level = 0.995, wider_gate = TRUE, subsample_pct = 0.3",,,,,Adaptive DNA singlet gate within the CEN branch
 tumor_dna_support,+,tumor_singlets,DNA_AREA_ASINH,boundary,"min = c(5.5), max = c(8)",,,,,DNA-A range support within tumor singlets
-cen_dna_support,+,cen_singlets,DNA_AREA_ASINH,boundary,"min = c(4.0), max = c(5.5)",,,,,DNA-A range support within CEN singlets
+cen_dna_support,+,cen,DNA_AREA_ASINH,boundary,"min = c(2.5), max = c(6)",,,,,DNA-A range support within CEN branch
 cells_keep,+,PeacoQC_Clean,,boolGate,cen_dna_support|tumor_dna_support,,,,,Union of branch-specific singlet populations passing DNA-A support

@@ -15,15 +15,22 @@ load_channel_map <- function(path) {
   channel_map
 }
 
-standardize_channels <- function(fs, channel_map) {
+standardize_channels <- function(fs, channel_map, allow_unmapped = "Original_ID") {
   raw_channels <- colnames(fs)
-  missing_channels <- setdiff(raw_channels, channel_map$raw_channel)
+  missing_channels <- setdiff(raw_channels, c(channel_map$raw_channel, allow_unmapped))
 
   if (length(missing_channels) > 0L) {
     stop("Channel map is missing raw channels: ", paste(missing_channels, collapse = ", "))
   }
 
-  mapped_channels <- channel_map$standard_channel[match(raw_channels, channel_map$raw_channel)]
+  mapped_channels <- raw_channels
+  mapped_idx <- match(raw_channels, channel_map$raw_channel)
+  mapped_channels[!is.na(mapped_idx)] <- channel_map$standard_channel[mapped_idx[!is.na(mapped_idx)]]
+
+  if (anyDuplicated(mapped_channels)) {
+    stop("Channel standardization produced duplicate channels: ", paste(unique(mapped_channels[duplicated(mapped_channels)]), collapse = ", "))
+  }
+
   colnames(fs) <- mapped_channels
   fs
 }
